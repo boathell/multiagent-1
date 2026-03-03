@@ -204,16 +204,14 @@ class CliAgentAdapter:
             base.append("All narrative text must be in Simplified Chinese.")
             base.append("Output concise sections: RED_RESULT, GREEN_RESULT, REFACTOR_NOTE, CHANGED_FILES.")
         else:
+            base.extend(CliAgentAdapter._review_context_lines(context))
             base.append(
                 "Review the changes and output first line exactly one token: APPROVED or NEEDS_CHANGES."
             )
             base.append("From the second line onward, write in Simplified Chinese.")
-            base.append("You have NO tool access and NO filesystem access in this run. Do NOT call tools.")
+            base.append("You should perform strict code review based on provided git diff and changed files.")
             base.append("Verify TDD evidence completeness and that RED->GREEN->REFACTOR order is respected.")
-            base.append(
-                "If concrete code diff is missing, perform lightweight process review and default to APPROVED; "
-                "use NEEDS_CHANGES only for clear blockers shown in the prompt."
-            )
+            base.append("If code diff/context is missing, return NEEDS_CHANGES and explain missing evidence.")
             base.append("Then explain concise reasons and actionable fixes.")
 
         return "\n".join(base)
@@ -233,4 +231,34 @@ class CliAgentAdapter:
                 lines.append(f"TDD_{key.upper()}: {value[:800]}")
             else:
                 lines.append(f"TDD_{key.upper()}: (missing)")
+        return lines
+
+    @staticmethod
+    def _review_context_lines(context: IssueContext) -> list[str]:
+        lines = ["Review Context:"]
+        changed_files = context.metadata.get("review_changed_files")
+        if isinstance(changed_files, list) and changed_files:
+            joined = ", ".join(str(x) for x in changed_files[:80])
+            lines.append(f"Changed Files: {joined}")
+        else:
+            lines.append("Changed Files: (none)")
+
+        diff_range = str(context.metadata.get("review_diff_range", "")).strip()
+        if diff_range:
+            lines.append(f"Diff Range: {diff_range}")
+
+        diff_text = str(context.metadata.get("review_diff", "")).strip()
+        if diff_text:
+            lines.append("Code Diff for Review:")
+            lines.append("```diff")
+            lines.append(diff_text)
+            lines.append("```")
+            if context.metadata.get("review_diff_truncated"):
+                lines.append("Diff Notice: truncated due to size; treat as partial evidence.")
+        else:
+            lines.append("Code Diff for Review: (missing)")
+
+        err = str(context.metadata.get("review_context_error", "")).strip()
+        if err:
+            lines.append(f"Review Context Error: {err}")
         return lines

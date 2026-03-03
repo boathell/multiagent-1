@@ -15,6 +15,26 @@
 - M6 测试与验收: done
 
 ## Progress Log
+- 时间: 2026-03-03 22:44:28 CST
+  - 里程碑: M2/M4
+  - 完成内容: 已按你确认执行“Review 未通过 -> 继续派发 Codex Coding”动作：针对 issue `f953a357-e672-47ba-b4ea-1e9d096e6280` 回写中文派单评论，明确继续修复目标（补齐可审查 diff、按审查意见修复核心文件）；当前编排状态保持在 Coding，等待本轮编码执行完成。
+  - 证据: Plane comment `ea62d1c4-2a0d-4794-96ef-a49b7cf6add7`；`issue_runs(f953...).state=Coding`；进程存在 `codex exec --skip-git-repo-check -`。
+  - 下一步: 编码完成后自动进入 Review；若再次 `NEEDS_CHANGES`，将把新审查意见继续回传给 Coding 阶段并循环至上限。
+- 时间: 2026-03-03 22:36:49 CST
+  - 里程碑: M2/M4/M6
+  - 完成内容: 按确认执行“当前 issue 触发 Review”验证：对 `f953a357-e672-47ba-b4ea-1e9d096e6280` 重新进入 Review 后，Gemini 返回 `NEEDS_CHANGES` 且给出明确代码审查意见（指出 diff 截断、无法完整核对 `tests/test_orchestrator.py` 与 `src/app/orchestrator.py` 关键改动），不再出现“缺上下文也默认 APPROVED”。
+  - 证据: `issue_traces` 新增 `id=102`（`stage=review,status=needs_changes`）；`metadata.stdout` 含文件级审查说明与整改建议；Plane 评论新增 `[编排器] | 阶段：审查 | 状态：需修改`（`status=needs_changes`）。
+  - 下一步: 继续收敛 Review 体验：将大 diff 分片/摘要后分段投喂给 Gemini，减少“diff 截断导致证据不足”的误报。
+- 时间: 2026-03-03 22:22:07 CST
+  - 里程碑: M1/M2/M6
+  - 完成内容: 按反馈强化 Review 真实代码审查：在进入 Review 阶段前自动采集 Git diff 与变更文件并注入 Gemini prompt；移除“无工具/无文件访问”和“缺 diff 默认 APPROVED”策略，改为缺少 diff 证据时必须 `NEEDS_CHANGES`。新增单测覆盖 review prompt 的 diff 注入与 orchestrator 的 diff 采集行为。
+  - 证据: `/Volumes/exFAT/multiagent/src/app/orchestrator.py`、`/Volumes/exFAT/multiagent/src/app/adapters/agents/cli_adapter.py`、`/Volumes/exFAT/multiagent/tests/test_orchestrator.py`、`/Volumes/exFAT/multiagent/tests/test_cli_agent_adapter.py`、`uv run pytest -q -> 46 passed`
+  - 下一步: 在 Plane 新建/重试一个包含实际代码改动的 issue，验证 Gemini 评论会引用具体文件与diff要点，不再出现“缺 diff 仍 APPROVED”。
+- 时间: 2026-03-03 21:57:44 CST
+  - 里程碑: M1/M2/M4/M6
+  - 完成内容: 修复你反馈的三点偏差：1) Design 自动补全后现在会同步回写 Plane issue 描述（`description_html`），不再只落本地库；2) 阶段评论的人类可读部分改为中文摘要为主（机器行 `[ORCH]` 保留原始摘要）；3) 记录 agent 调用细节到 `StageResult.artifacts`（command/prompt_mode/timeout/cwd）用于定位 `codex timeout`。并在同项目 issue 复验：`f953a357-e672-47ba-b4ea-1e9d096e6280` 与 `e97c0ad0-2552-416b-94d4-0dc5d9882e1c` 均已出现 Red/Green/Refactor 回填。
+  - 证据: `/Volumes/exFAT/multiagent/src/app/orchestrator.py`、`/Volumes/exFAT/multiagent/src/app/adapters/plane_client.py`、`/Volumes/exFAT/multiagent/src/app/adapters/agents/cli_adapter.py`、`/Volumes/exFAT/multiagent/tests/test_orchestrator.py`、`/Volumes/exFAT/multiagent/tests/test_cli_agent_adapter.py`、`/Volumes/exFAT/multiagent/tests/test_plane_client.py`、`uv run pytest -q -> 44 passed`；Plane API 查询 `work-items/f953...` 与 `work-items/e97...` 的 `description_html` 包含 `Red/Green/Refactor`。
+  - 下一步: 处理 GitHub push 失败（`git push -u origin <branch>` 返回 128）导致 Coding 阶段中断的问题，完成同 issue 的 Coding->Review 全链路稳定性验收。
 - 时间: 2026-03-03 21:24:01 CST
   - 里程碑: M3/M4/M6
   - 完成内容: 在同一 Plane 项目继续验证并定位运行时问题：确认全局环境变量 `PLANE_BASE_URL=https://localhost:8080/api` 会覆盖 `.env`，导致 Plane 回写出现 SSL 失败；已改为先 `source .env` 再启动单实例 uvicorn。随后对验证 issue（`c0e23ec9-1b62-4366-a51d-7a9a3bc8145f`）执行 retry，Design 仍可自动补全且无 `[TDD-提醒]`，但 Coding 进入 GitHub 推送基线分支失败（`git push -u origin main`）导致 500。

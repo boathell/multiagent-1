@@ -4,6 +4,7 @@ import asyncio
 import html
 import logging
 import re
+import subprocess
 from typing import Any
 
 from app.config import AppConfig
@@ -282,6 +283,14 @@ class Orchestrator:
                 review_loops=int(issue.get("review_loops", 0)),
                 tdd_sections=self.parse_tdd_sections(str(issue.get("description", ""))),
             )
+            if stage == Stage.REVIEW:
+                context.metadata.update(
+                    self._collect_review_context(
+                        local_path=project.local_path,
+                        base_branch=project.base_branch,
+                        branch=context.branch,
+                    )
+                )
 
             self.store.update_issue_fields(issue_id, last_stage=stage.value)
             result = await self.agent_adapter.run_stage(stage, context)
@@ -586,6 +595,9 @@ class Orchestrator:
             marker = Orchestrator._detect_tdd_section_marker(line)
             if marker:
                 current = marker
+                inline_content = Orchestrator._extract_inline_tdd_section_content(line, marker)
+                if inline_content:
+                    buffers[current].append(inline_content)
                 continue
             if current:
                 buffers[current].append(raw_line.rstrip())
@@ -604,25 +616,51 @@ class Orchestrator:
         if not cleaned:
             return None
 
+        if re.match(r"^tdd[\s_-]*red(?:\s*[:：].*)?$", cleaned):
+            return "red"
         if Orchestrator._matches_tdd_stage_heading(cleaned, "red"):
             return "red"
         if cleaned.startswith("red_result") or cleaned.startswith("red_stage"):
             return "red"
+        if re.match(r"^tdd[\s_-]*green(?:\s*[:：].*)?$", cleaned):
+            return "green"
         if Orchestrator._matches_tdd_stage_heading(cleaned, "green"):
             return "green"
         if cleaned.startswith("green_result") or cleaned.startswith("green_stage"):
             return "green"
+        if re.match(r"^tdd[\s_-]*refactor(?:\s*[:：].*)?$", cleaned):
+            return "refactor"
         if Orchestrator._matches_tdd_stage_heading(cleaned, "refactor"):
             return "refactor"
         if cleaned.startswith("重构阶段"):
             return "refactor"
         if cleaned.startswith("refactor_note") or cleaned.startswith("refactor_stage"):
             return "refactor"
+        if re.match(r"^tdd[\s_-]*acceptance(?:\s*[:：].*)?$", cleaned):
+            return "acceptance"
         if cleaned.startswith("验收标准") or cleaned.startswith("acceptance criteria") or cleaned == "dod":
             return "acceptance"
         if cleaned.startswith("acceptance") or cleaned.startswith("dod"):
             return "acceptance"
         return None
+
+    @staticmethod
+    def _extract_inline_tdd_section_content(line: str, marker: str) -> str:
+        token_map = {
+            "red": (r"tdd[\s_-]*red", r"red_result", r"red_stage"),
+            "green": (r"tdd[\s_-]*green", r"green_result", r"green_stage"),
+            "refactor": (r"tdd[\s_-]*refactor", r"refactor_note", r"refactor_stage"),
+            "acceptance": (r"tdd[\s_-]*acceptance", r"acceptance(?:\s+criteria)?", r"dod"),
+        }
+        for token in token_map.get(marker, ()):
+            matched = re.match(rf"(?i)^[\s#>*`\-0-9\.\)\(]*{token}\s*[:：]\s*(.+)$", line.strip())
+            if not matched:
+                continue
+            content = matched.group(1).strip()
+            if content.lower() in {"(missing)", "missing", "n/a", "na", "none"}:
+                return ""
+            return content
+        return ""
 
     @staticmethod
     def _matches_tdd_stage_heading(cleaned: str, token: str) -> bool:
@@ -713,6 +751,94 @@ class Orchestrator:
 
         flush_list()
         return "".join(parts) if parts else "<p></p>"
+
+    @staticmethod
+    def _run_git(local_path: str, args: list[str]) -> tuple[bool, str]:
+        try:
+            completed = subprocess.run(
+                args,
+                cwd=local_path,
+                check=False,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+        except Exception as exc:  # noqa: BLE001
+            return False, str(exc)
+        output = "\n".join(x for x in [completed.stdout, completed.stderr] if x).strip()
+        if completed.returncode != 0:
+            return False, output or f"exit={completed.returncode}"
+        return True, output.strip()
+
+    def _collect_review_context(self, local_path: str, base_branch: str, branch: str) -> dict[str, Any]:
+        meta: dict[str, Any] = {
+            "review_base_branch": base_branch,
+            "review_branch": branch,
+            "review_changed_files": [],
+            "review_diff": "",
+            "review_diff_range": "",
+            "review_diff_truncated": False,
+        }
+        if not local_path:
+            meta["review_context_error"] = "workspace path is empty"
+            return meta
+
+        ok_git, _ = self._run_git(local_path, ["git", "rev-parse", "--is-inside-work-tree"])
+        if not ok_git:
+            meta["review_context_error"] = f"not a git repo: {local_path}"
+            return meta
+
+        ok_head, head_branch = self._run_git(local_path, ["git", "rev-parse", "--abbrev-ref", "HEAD"])
+        if ok_head and head_branch and not meta["review_branch"]:
+            meta["review_branch"] = head_branch
+
+        branch_ref = str(meta["review_branch"] or "").strip()
+        range_candidates: list[str] = []
+        if branch_ref and branch_ref != "HEAD":
+            range_candidates.extend(
+                [
+                    f"origin/{base_branch}...{branch_ref}",
+                    f"{base_branch}...{branch_ref}",
+                    f"origin/{base_branch}..{branch_ref}",
+                    f"{base_branch}..{branch_ref}",
+                ]
+            )
+        range_candidates.extend(["origin/HEAD..HEAD", "HEAD~1..HEAD"])
+
+        chosen_range = ""
+        changed_files: list[str] = []
+        diff_text = ""
+        last_error = ""
+        for rng in range_candidates:
+            ok_files, files_out = self._run_git(local_path, ["git", "diff", "--name-only", rng])
+            ok_diff, diff_out = self._run_git(local_path, ["git", "diff", "--no-color", rng])
+            if not ok_files or not ok_diff:
+                last_error = files_out if not ok_files else diff_out
+                continue
+            chosen_range = rng
+            changed_files = [x.strip() for x in files_out.splitlines() if x.strip()]
+            diff_text = diff_out
+            break
+
+        if not chosen_range:
+            ok_files, files_out = self._run_git(local_path, ["git", "diff", "--name-only"])
+            ok_diff, diff_out = self._run_git(local_path, ["git", "diff", "--no-color"])
+            if ok_files and ok_diff:
+                chosen_range = "working-tree"
+                changed_files = [x.strip() for x in files_out.splitlines() if x.strip()]
+                diff_text = diff_out
+            else:
+                meta["review_context_error"] = last_error or files_out or diff_out or "failed to collect diff"
+                return meta
+
+        max_chars = 120_000
+        meta["review_diff_range"] = chosen_range
+        meta["review_changed_files"] = changed_files
+        meta["review_diff_truncated"] = len(diff_text) > max_chars
+        meta["review_diff"] = diff_text[:max_chars]
+        if not diff_text.strip():
+            meta["review_context_error"] = "empty diff"
+        return meta
 
     @staticmethod
     def should_start_pipeline(event_type: str, issue_data: dict[str, str]) -> bool:
