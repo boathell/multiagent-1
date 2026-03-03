@@ -15,6 +15,11 @@
 - M6 测试与验收: done
 
 ## Progress Log
+- 时间: 2026-03-03 12:29:32 CST
+  - 里程碑: M3/M6
+  - 完成内容: 完成 GitHub 非 Mock 首次提交能力：真实模式下自动初始化本地 git、自动创建远端仓库、重名自动改后缀（`-1/-2...`）、自动设置 origin、首次无提交时自动创建并推送 base 分支；已切换 `GITHUB_USE_MOCK=false` 并完成真实仓库联调。
+  - 证据: `/Volumes/exFAT/multiagent/src/app/adapters/github_client.py`、`/Volumes/exFAT/multiagent/tests/test_github_client.py`、`/Volumes/exFAT/multiagent/src/app/orchestrator.py`、`/Volumes/exFAT/multiagent/.env`、`/Volumes/exFAT/multiagent/.env.example`、`uv run pytest -q -> 30 passed`、真实 PR `https://github.com/boathell/multiagent-1/pull/1`
+  - 下一步: 用 Plane 新 issue 走全链路验证（Design->Coding->Review），确认编排路径下也稳定创建真实 PR 并回写中文评论。
 - 时间: 2026-03-03 12:20:03 CST
   - 里程碑: M1/M4/M6
   - 完成内容: 按确认完成失败重试/阻塞原因的中文评论模板：失败阶段评论增加“原因”字段；失败重试时新增“重试中”评论；进入 Blocked 时新增“已阻塞+处理建议”评论，均保留 `[ORCH]` 结构化行。

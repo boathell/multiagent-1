@@ -1,6 +1,6 @@
 projects:
   5316280a-ada0-44af-8c7d-3b1408e796a0:
-    repo_url: https://github.com/boathell/multiagent.git
+    repo_url: https://github.com/boathell/multiagent-1.git
     local_path: /Volumes/exFAT/multiagent
     base_branch: main
     state_map:
