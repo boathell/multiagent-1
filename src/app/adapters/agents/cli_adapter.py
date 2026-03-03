@@ -12,6 +12,7 @@ class CliAgentAdapter:
     def __init__(self, agent_config: dict[str, Any] | None = None) -> None:
         self._agent_config = agent_config or {}
         self._agents = self._agent_config.get("agents", {})
+        self._tdd_enabled = bool(self._agent_config.get("tdd_enabled", True))
         self._stage_agent_map = {
             Stage.DESIGN: "claude",
             Stage.CODING: "codex",
@@ -40,6 +41,7 @@ class CliAgentAdapter:
                 child_env[str(key)] = str(value)
         timeout_sec = int(cfg.get("timeout_sec", 300))
         prompt_mode = str(cfg.get("prompt_mode", "stdin")).lower()
+        context.metadata["tdd_enabled"] = self._tdd_enabled
         prompt = self._build_prompt(stage, context)
 
         cmd_parts = shlex.split(command)
@@ -155,20 +157,25 @@ class CliAgentAdapter:
             f"Repository: {context.repo_url}",
             f"Workspace: {context.local_path}",
         ]
+        if context.metadata.get("tdd_enabled", True):
+            base.extend(CliAgentAdapter._tdd_prompt_lines(context))
 
         if stage == Stage.DESIGN:
             base.append(
-                "Create an implementation design with concise acceptance criteria and main risks."
+                "Use TDD-first planning. Evaluate whether RED tests are sufficient before implementation."
             )
+            base.append("Output concise sections: RED_COVERAGE, GAPS, RISKS, ACCEPTANCE.")
         elif stage == Stage.CODING:
             base.append(
-                "Implement the issue in the local workspace and report what changed."
+                "Follow TDD sequence strictly: RED (failing tests) -> GREEN (minimal implementation) -> REFACTOR."
             )
+            base.append("Output concise sections: RED_RESULT, GREEN_RESULT, REFACTOR_NOTE, CHANGED_FILES.")
         else:
             base.append(
                 "Review the changes and output first line exactly one token: APPROVED or NEEDS_CHANGES."
             )
             base.append("You have NO tool access and NO filesystem access in this run. Do NOT call tools.")
+            base.append("Verify TDD evidence completeness and that RED->GREEN->REFACTOR order is respected.")
             base.append(
                 "If concrete code diff is missing, perform lightweight process review and default to APPROVED; "
                 "use NEEDS_CHANGES only for clear blockers shown in the prompt."
@@ -176,3 +183,20 @@ class CliAgentAdapter:
             base.append("Then explain concise reasons and actionable fixes.")
 
         return "\n".join(base)
+
+    @staticmethod
+    def _tdd_prompt_lines(context: IssueContext) -> list[str]:
+        lines = ["TDD Template Context:"]
+        if context.description.strip():
+            lines.append(f"Issue Description (normalized, truncated): {context.description[:1200]}")
+        else:
+            lines.append("Issue Description: (empty)")
+
+        sections = context.tdd_sections or {}
+        for key in ("red", "green", "refactor", "acceptance"):
+            value = str(sections.get(key, "")).strip()
+            if value:
+                lines.append(f"TDD_{key.upper()}: {value[:800]}")
+            else:
+                lines.append(f"TDD_{key.upper()}: (missing)")
+        return lines

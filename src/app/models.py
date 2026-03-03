@@ -31,6 +31,7 @@ class IssueContext:
     issue_id: str
     project_id: str
     title: str = ""
+    description: str = ""
     repo_url: str = ""
     local_path: str = ""
     base_branch: str = "main"
@@ -38,6 +39,7 @@ class IssueContext:
     pr_url: str = ""
     attempts: dict[str, int] = field(default_factory=dict)
     review_loops: int = 0
+    tdd_sections: dict[str, str] = field(default_factory=dict)
     metadata: dict[str, Any] = field(default_factory=dict)
 
 

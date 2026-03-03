@@ -24,4 +24,5 @@ agents:
     prompt_mode: "arg"
     timeout_sec: 300
 
+tdd_enabled: true
 use_mock: false

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import html
 import logging
 import re
 from typing import Any
@@ -55,6 +56,7 @@ class Orchestrator:
                     project_id=issue_data["project_id"],
                     title=issue_data["title"],
                     state=issue_data["state"],
+                    description=issue_data["description"],
                 )
                 return {"status": "ignored", "reason": "event filtered", "event_id": event_id}
 
@@ -62,6 +64,7 @@ class Orchestrator:
                 issue_id=issue_id,
                 project_id=issue_data["project_id"],
                 title=issue_data["title"],
+                description=issue_data["description"],
                 force=False,
             )
 
@@ -93,6 +96,7 @@ class Orchestrator:
                 issue_id=issue_id,
                 project_id=issue["project_id"],
                 title=issue["title"],
+                description=str(issue.get("description", "")),
                 force=True,
             )
         return {"status": "replayed", "issue_id": issue_id}
@@ -106,6 +110,7 @@ class Orchestrator:
         project_id: str,
         title: str,
         force: bool,
+        description: str = "",
     ) -> None:
         project = self.config.get_project(project_id)
         if project is None:
@@ -115,14 +120,29 @@ class Orchestrator:
                 status="blocked",
                 message=f"No project mapping for project_id={project_id}",
             )
-            self.store.upsert_issue(issue_id, project_id, title, PipelineState.BLOCKED.value)
+            self.store.upsert_issue(
+                issue_id,
+                project_id,
+                title,
+                PipelineState.BLOCKED.value,
+                description=description,
+            )
             return
 
         existing = self.store.get_issue(issue_id)
         if existing is None:
-            self.store.upsert_issue(issue_id, project_id, title, PipelineState.TODO.value)
+            self.store.upsert_issue(
+                issue_id,
+                project_id,
+                title,
+                PipelineState.TODO.value,
+                description=description,
+            )
             existing = self.store.get_issue(issue_id)
         assert existing is not None
+        if description:
+            self.store.update_issue_fields(issue_id, description=description)
+            existing = self.store.get_issue(issue_id) or existing
 
         current_state = to_state(existing["state"])
         if current_state == PipelineState.TODO:
@@ -143,6 +163,19 @@ class Orchestrator:
                 message=f"Issue already in terminal state: {current_state.value}",
             )
             return
+
+        issue_description = str(existing.get("description", ""))
+        tdd_sections = self.parse_tdd_sections(issue_description)
+        missing_sections = self._tdd_missing_sections(tdd_sections)
+        if missing_sections and not self._has_tdd_reminder(issue_id):
+            labels = {"red": "Red", "green": "Green", "refactor": "Refactor"}
+            missing_names = ", ".join(labels.get(x, x) for x in missing_sections)
+            tdd_msg = (
+                "[TDD-提醒] 缺少 Red/Green/Refactor 段落，已按降级模式执行。"
+                f" 当前缺失: {missing_names}"
+            )
+            self.store.append_trace(issue_id, stage="tdd", status="reminder", message=tdd_msg)
+            await self.plane_client.add_comment(project_id=project_id, issue_id=issue_id, comment=tdd_msg)
 
         while True:
             stage = stage_for_state(current_state)
@@ -218,6 +251,7 @@ class Orchestrator:
                 issue_id=issue_id,
                 project_id=project_id,
                 title=title,
+                description=str(issue.get("description", "")),
                 repo_url=project.repo_url,
                 local_path=project.local_path,
                 base_branch=project.base_branch,
@@ -225,6 +259,7 @@ class Orchestrator:
                 pr_url=issue.get("pr_url", ""),
                 attempts=issue.get("attempts", {}),
                 review_loops=int(issue.get("review_loops", 0)),
+                tdd_sections=self.parse_tdd_sections(str(issue.get("description", ""))),
             )
 
             self.store.update_issue_fields(issue_id, last_stage=stage.value)
@@ -449,6 +484,7 @@ class Orchestrator:
             project_id = item["project"].get("id")
 
         title = item.get("name") or item.get("title") or "Untitled"
+        description = Orchestrator._extract_issue_description(item)
         state_name = item.get("state_name")
         if not state_name and isinstance(item.get("state"), dict):
             state_name = item["state"].get("name")
@@ -461,8 +497,81 @@ class Orchestrator:
             "issue_id": str(issue_id),
             "project_id": str(project_id),
             "title": str(title),
+            "description": description,
             "state": str(state_name),
         }
+
+    @staticmethod
+    def _extract_issue_description(item: dict[str, Any]) -> str:
+        for key in ("description_html", "description", "description_binary", "description_markdown"):
+            value = item.get(key)
+            if isinstance(value, str) and value.strip():
+                return Orchestrator._normalize_description(value)
+        return ""
+
+    @staticmethod
+    def _normalize_description(raw: str) -> str:
+        text = raw
+        text = re.sub(r"</h[1-6]>", "\n", text, flags=re.IGNORECASE)
+        text = re.sub(r"<li[^>]*>", "- ", text, flags=re.IGNORECASE)
+        text = re.sub(r"</li>", "\n", text, flags=re.IGNORECASE)
+        text = text.replace("</p>", "\n").replace("<br>", "\n").replace("<br/>", "\n").replace("<br />", "\n")
+        text = re.sub(r"<[^>]+>", " ", text)
+        text = html.unescape(text)
+        text = text.replace("\r\n", "\n")
+        text = re.sub(r"\n{3,}", "\n\n", text)
+        text = re.sub(r"[ \t]{2,}", " ", text)
+        return text.strip()
+
+    @staticmethod
+    def parse_tdd_sections(description: str) -> dict[str, str]:
+        sections = {"red": "", "green": "", "refactor": "", "acceptance": ""}
+        if not description.strip():
+            return sections
+
+        buffers = {k: [] for k in sections}
+        current: str | None = None
+        for raw_line in description.splitlines():
+            line = raw_line.strip()
+            marker = Orchestrator._detect_tdd_section_marker(line)
+            if marker:
+                current = marker
+                continue
+            if current:
+                buffers[current].append(raw_line.rstrip())
+
+        for key, lines in buffers.items():
+            sections[key] = "\n".join(x for x in lines if x.strip()).strip()
+        return sections
+
+    @staticmethod
+    def _detect_tdd_section_marker(line: str) -> str | None:
+        if not line:
+            return None
+        cleaned = line.lower()
+        cleaned = re.sub(r"^[\s#>*`\-0-9\.\)\(]+", "", cleaned)
+        cleaned = re.sub(r"[*_`]", "", cleaned).strip()
+        if not cleaned:
+            return None
+
+        if "red" in cleaned and ("阶段" in cleaned or "stage" in cleaned or cleaned.startswith("red")):
+            return "red"
+        if "green" in cleaned and ("阶段" in cleaned or "stage" in cleaned or cleaned.startswith("green")):
+            return "green"
+        if "refactor" in cleaned or "重构阶段" in cleaned or cleaned.startswith("refactor"):
+            return "refactor"
+        if "验收标准" in cleaned or "acceptance criteria" in cleaned or cleaned == "dod":
+            return "acceptance"
+        return None
+
+    @staticmethod
+    def _tdd_missing_sections(tdd_sections: dict[str, str]) -> list[str]:
+        required = ("red", "green", "refactor")
+        return [name for name in required if not str(tdd_sections.get(name, "")).strip()]
+
+    def _has_tdd_reminder(self, issue_id: str) -> bool:
+        traces = self.store.get_trace(issue_id)
+        return any(t.get("stage") == "tdd" and t.get("status") == "reminder" for t in traces)
 
     @staticmethod
     def should_start_pipeline(event_type: str, issue_data: dict[str, str]) -> bool:

@@ -41,6 +41,7 @@ class SQLiteStore:
                     issue_id TEXT PRIMARY KEY,
                     project_id TEXT NOT NULL,
                     title TEXT NOT NULL DEFAULT '',
+                    description TEXT NOT NULL DEFAULT '',
                     state TEXT NOT NULL,
                     branch TEXT NOT NULL DEFAULT '',
                     pr_url TEXT NOT NULL DEFAULT '',
@@ -61,6 +62,17 @@ class SQLiteStore:
                 );
                 """
             )
+            self._ensure_issue_runs_columns(conn)
+
+    @staticmethod
+    def _ensure_issue_runs_columns(conn: sqlite3.Connection) -> None:
+        cols = {
+            str(row[1])
+            for row in conn.execute("PRAGMA table_info(issue_runs)").fetchall()
+            if len(row) > 1
+        }
+        if "description" not in cols:
+            conn.execute("ALTER TABLE issue_runs ADD COLUMN description TEXT NOT NULL DEFAULT ''")
 
     def is_event_processed(self, event_id: str) -> bool:
         with self._conn() as conn:
@@ -90,20 +102,31 @@ class SQLiteStore:
         data.pop("attempts_json", None)
         return data
 
-    def upsert_issue(self, issue_id: str, project_id: str, title: str, state: str) -> None:
+    def upsert_issue(
+        self,
+        issue_id: str,
+        project_id: str,
+        title: str,
+        state: str,
+        description: str = "",
+    ) -> None:
         now = shanghai_now_iso()
         with self._conn() as conn:
             conn.execute(
                 """
-                INSERT INTO issue_runs(issue_id, project_id, title, state, updated_at)
-                VALUES(?, ?, ?, ?, ?)
+                INSERT INTO issue_runs(issue_id, project_id, title, description, state, updated_at)
+                VALUES(?, ?, ?, ?, ?, ?)
                 ON CONFLICT(issue_id) DO UPDATE SET
                     project_id = excluded.project_id,
                     title = CASE WHEN excluded.title != '' THEN excluded.title ELSE issue_runs.title END,
+                    description = CASE
+                        WHEN excluded.description != '' THEN excluded.description
+                        ELSE issue_runs.description
+                    END,
                     state = excluded.state,
                     updated_at = excluded.updated_at
                 """,
-                (issue_id, project_id, title, state, now),
+                (issue_id, project_id, title, description, state, now),
             )
 
     def update_issue_fields(self, issue_id: str, **fields: Any) -> None:
@@ -115,6 +138,7 @@ class SQLiteStore:
             "state",
             "branch",
             "pr_url",
+            "description",
             "attempts",
             "review_loops",
             "last_stage",
@@ -200,4 +224,3 @@ class SQLiteStore:
             record.pop("metadata_json", None)
             traces.append(record)
         return traces
-

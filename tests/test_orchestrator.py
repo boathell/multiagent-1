@@ -197,6 +197,68 @@ def test_extract_event_id_handles_non_dict_data():
     assert event_id.startswith("ping:unknown:")
 
 
+def test_extract_issue_includes_description():
+    payload = {
+        "event": "work_item.created",
+        "data": {
+            "work_item": {
+                "id": "1201",
+                "project_id": "p1",
+                "name": "TDD task",
+                "state_name": "Todo",
+                "description_html": "<h3>Red 阶段</h3><p>case A</p><h3>Green 阶段</h3><p>impl A</p>",
+            }
+        },
+    }
+    issue = Orchestrator.extract_issue(payload)
+    assert issue is not None
+    assert "Red 阶段" in issue["description"]
+    assert "Green 阶段" in issue["description"]
+
+
+def test_parse_tdd_sections_cn_template():
+    description = """
+### Red 阶段（先失败）
+- T1
+### Green 阶段（最小实现）
+- G1
+### Refactor 阶段（重构）
+- R1
+### 验收标准（DoD）
+- A1
+"""
+    sections = Orchestrator.parse_tdd_sections(description)
+    assert "T1" in sections["red"]
+    assert "G1" in sections["green"]
+    assert "R1" in sections["refactor"]
+    assert "A1" in sections["acceptance"]
+
+
+@pytest.mark.asyncio
+async def test_missing_tdd_sections_adds_reminder_comment(make_config, tmp_path: Path):
+    config = make_config(project_id="p1")
+    store = SQLiteStore(str(tmp_path / "db7.sqlite"))
+    plane = FakePlaneClient()
+    orch = Orchestrator(
+        app_config=config,
+        store=store,
+        plane_client=plane,
+        github_client=FakeGitHubClient(),
+        agent_adapter=ScriptedAgent(),
+        quality_gate=QualityGate(),
+    )
+
+    await orch.process_issue(
+        issue_id="1007",
+        project_id="p1",
+        title="missing tdd",
+        force=False,
+        description="just title and notes",
+    )
+
+    assert any("[TDD-提醒]" in comment for _, _, comment in plane.comments)
+
+
 def test_build_stage_comment_includes_chinese_and_machine_fields():
     result = StageResult(
         status=StageStatus.SUCCESS,

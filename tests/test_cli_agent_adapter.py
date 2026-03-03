@@ -15,8 +15,15 @@ def _ctx() -> IssueContext:
         issue_id="i-1",
         project_id="p-1",
         title="demo",
+        description="### Red 阶段\n- case A\n### Green 阶段\n- impl A\n### Refactor 阶段\n- cleanup",
         repo_url="https://github.com/boathell/multiagent.git",
         local_path="/tmp",
+        tdd_sections={
+            "red": "case A should fail first",
+            "green": "minimal impl",
+            "refactor": "cleanup naming",
+            "acceptance": "all tests pass",
+        },
     )
 
 
@@ -108,6 +115,17 @@ async def test_cli_adapter_arg_prompt_and_cwd(tmp_path: Path):
     assert result.status == StageStatus.SUCCESS
     assert "You are an execution agent in a multi-agent pipeline." in result.artifacts["stdout"]
     assert str(tmp_path) in result.artifacts["stdout"]
+
+
+def test_cli_adapter_build_prompt_contains_tdd_sections():
+    prompt = CliAgentAdapter._build_prompt(Stage.CODING, _ctx())
+    assert "TDD Template Context:" in prompt
+    assert "TDD_RED:" in prompt
+    assert "TDD_GREEN:" in prompt
+    assert "TDD_REFACTOR:" in prompt
+    assert "RED_RESULT" in prompt
+    assert "GREEN_RESULT" in prompt
+    assert "REFACTOR_NOTE" in prompt
 
 
 @pytest.mark.asyncio

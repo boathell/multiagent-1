@@ -15,6 +15,16 @@
 - M6 测试与验收: done
 
 ## Progress Log
+- 时间: 2026-03-03 13:59:10 CST
+  - 里程碑: M1/M2/M6
+  - 完成内容: 完成 TDD issue 模板接入：新增 TDD 文档模板与填写指南；编排器可从 Plane issue 描述提取并解析 Red/Green/Refactor/验收标准；TDD 上下文已注入 Kimi/Codex/Gemini 三阶段提示词；缺少关键段落时以中文 `[TDD-提醒]` 评论降级提示（不阻断）。
+  - 证据: `/Volumes/exFAT/multiagent/docs/tdd/plane_issue_template.md`、`/Volumes/exFAT/multiagent/docs/tdd/plane_issue_fill_guide.md`、`/Volumes/exFAT/multiagent/docs/tdd/examples/sample_issue_feature.md`、`/Volumes/exFAT/multiagent/src/app/orchestrator.py`、`/Volumes/exFAT/multiagent/src/app/store.py`、`/Volumes/exFAT/multiagent/src/app/models.py`、`/Volumes/exFAT/multiagent/src/app/adapters/agents/cli_adapter.py`、`uv run pytest -q -> 36 passed`
+  - 下一步: 在 Plane 新建一条完整 TDD 模板 issue 做真实联调，确认 Design/Coding/Review 评论中可观察到模板驱动结果摘要。
+- 时间: 2026-03-03 12:41:16 CST
+  - 里程碑: M3/M4/M6
+  - 完成内容: 使用你新建 issue（`d9d4a050-1abb-44b3-81ea-004743ab3add`）完成真实链路验证：已跑通 Todo -> Design(Kimi) -> Coding(Codex) -> Review(Gemini) -> Done，并成功创建真实 GitHub PR；Plane 评论按中文模板回写。
+  - 证据: 本地 trace `issue_runs.pr_url=https://github.com/boathell/multiagent-1/pull/2`；Plane issue 状态 `Done`；Plane comments 共 3 条且包含 `[编排器] | 阶段：设计/编码/审查`
+  - 下一步: 把 webhook 触发从“手工补发 payload”切到 Plane 后台自动 webhook（created/updated/comment），避免每次新 issue 手动触发。
 - 时间: 2026-03-03 12:29:32 CST
   - 里程碑: M3/M6
   - 完成内容: 完成 GitHub 非 Mock 首次提交能力：真实模式下自动初始化本地 git、自动创建远端仓库、重名自动改后缀（`-1/-2...`）、自动设置 origin、首次无提交时自动创建并推送 base 分支；已切换 `GITHUB_USE_MOCK=false` 并完成真实仓库联调。
