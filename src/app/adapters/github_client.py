@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import logging
 import os
 import re
@@ -161,6 +162,42 @@ class GitHubClient:
         if not has_remote_base or not remote_output.strip():
             self._run(["git", "push", "-u", "origin", base_branch], cwd=local_path)
 
+    def _has_staged_changes(self, local_path: str) -> bool:
+        ok, output = self._try_run(["git", "diff", "--cached", "--quiet"], cwd=local_path)
+        if ok:
+            return False
+        if output.strip():
+            raise RuntimeError(f"Failed to detect staged changes: {output}")
+        return True
+
+    def _find_existing_pr_url(self, local_path: str, branch: str) -> str:
+        ok, output = self._try_run(
+            [
+                "gh",
+                "pr",
+                "list",
+                "--head",
+                branch,
+                "--state",
+                "all",
+                "--json",
+                "url",
+                "--limit",
+                "1",
+            ],
+            cwd=local_path,
+        )
+        if not ok or not output.strip():
+            return ""
+        try:
+            data = json.loads(output)
+        except json.JSONDecodeError:
+            return ""
+        if isinstance(data, list) and data and isinstance(data[0], dict):
+            url = str(data[0].get("url", "")).strip()
+            return url
+        return ""
+
     def create_branch_commit_and_pr(
         self,
         issue_id: str,
@@ -186,15 +223,11 @@ class GitHubClient:
         self._run(["git", "checkout", "-B", branch], cwd=local_path)
         self._run(["git", "add", "-A"], cwd=local_path)
 
-        try:
+        if self._has_staged_changes(local_path):
             self._run(["git", "commit", "-m", f"feat(issue-{issue_id}): {title}"], cwd=local_path)
-        except subprocess.CalledProcessError as exc:
-            stderr = (exc.stderr or "").lower()
-            if "nothing to commit" not in stderr:
-                raise
 
         self._run(["git", "push", "-u", "origin", branch], cwd=local_path)
-        pr_url = self._run(
+        ok, pr_output = self._try_run(
             [
                 "gh",
                 "pr",
@@ -210,4 +243,14 @@ class GitHubClient:
             ],
             cwd=local_path,
         )
+        if ok:
+            pr_url = pr_output.strip()
+        else:
+            lowered = pr_output.lower()
+            if "already exists" in lowered or "a pull request already exists" in lowered:
+                pr_url = self._find_existing_pr_url(local_path, branch)
+                if not pr_url:
+                    raise RuntimeError(f"PR exists but failed to resolve URL for branch {branch}")
+            else:
+                raise RuntimeError(f"Failed to create PR for branch {branch}: {pr_output}")
         return PullRequestResult(branch=branch, pr_url=pr_url)

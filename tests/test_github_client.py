@@ -114,3 +114,88 @@ def test_create_pr_uses_existing_origin_without_repo_create(monkeypatch, tmp_pat
     assert result.branch == branch
     assert result.pr_url.endswith("/pull/2")
     assert not any(cmd[:3] == ["gh", "repo", "create"] for cmd in calls)
+
+
+def test_create_pr_reuses_existing_pr_when_branch_already_has_pr(monkeypatch, tmp_path: Path):
+    client = _make_client(tmp_path)
+    calls: list[list[str]] = []
+    issue_id = "2003"
+    title = "existing pr"
+    branch = client.branch_name(issue_id, title)
+
+    def fake_run(cmd: list[str], cwd: str) -> str:
+        calls.append(cmd)
+        if cmd == ["git", "remote", "get-url", "origin"]:
+            return "https://github.com/boathell/existing.git"
+        if cmd == ["git", "rev-parse", "--is-inside-work-tree"]:
+            return "true"
+        if cmd == ["git", "config", "user.name"]:
+            return "boathell"
+        if cmd == ["git", "config", "user.email"]:
+            return "boathell@users.noreply.github.com"
+        if cmd == ["git", "rev-parse", "--verify", "HEAD"]:
+            return "abc123"
+        if cmd == ["git", "show-ref", "--verify", "refs/heads/main"]:
+            return "abc123 refs/heads/main"
+        if cmd == ["git", "ls-remote", "--heads", "origin", "main"]:
+            return "abc123\trefs/heads/main"
+        if cmd == ["git", "diff", "--cached", "--quiet"]:
+            return ""
+        if cmd[:3] == ["gh", "pr", "create"]:
+            raise _called_process_error(cmd, "a pull request already exists for branch")
+        if cmd[:3] == ["gh", "pr", "list"]:
+            return '[{"url":"https://github.com/boathell/existing/pull/99"}]'
+        return ""
+
+    monkeypatch.setattr(client, "_run", fake_run)
+
+    result = client.create_branch_commit_and_pr(
+        issue_id=issue_id,
+        title=title,
+        body="body",
+        local_path=str(tmp_path),
+        base_branch="main",
+        repo_url="https://github.com/boathell/existing.git",
+    )
+    assert result.branch == branch
+    assert result.pr_url.endswith("/pull/99")
+
+
+def test_create_pr_commits_when_staged_changes_detected(monkeypatch, tmp_path: Path):
+    client = _make_client(tmp_path)
+    calls: list[list[str]] = []
+
+    def fake_run(cmd: list[str], cwd: str) -> str:
+        calls.append(cmd)
+        if cmd == ["git", "remote", "get-url", "origin"]:
+            return "https://github.com/boathell/existing.git"
+        if cmd == ["git", "rev-parse", "--is-inside-work-tree"]:
+            return "true"
+        if cmd == ["git", "config", "user.name"]:
+            return "boathell"
+        if cmd == ["git", "config", "user.email"]:
+            return "boathell@users.noreply.github.com"
+        if cmd == ["git", "rev-parse", "--verify", "HEAD"]:
+            return "abc123"
+        if cmd == ["git", "show-ref", "--verify", "refs/heads/main"]:
+            return "abc123 refs/heads/main"
+        if cmd == ["git", "ls-remote", "--heads", "origin", "main"]:
+            return "abc123\trefs/heads/main"
+        if cmd == ["git", "diff", "--cached", "--quiet"]:
+            raise _called_process_error(cmd, "")
+        if cmd[:3] == ["gh", "pr", "create"]:
+            return "https://github.com/boathell/existing/pull/100"
+        return ""
+
+    monkeypatch.setattr(client, "_run", fake_run)
+
+    result = client.create_branch_commit_and_pr(
+        issue_id="2004",
+        title="staged changes",
+        body="body",
+        local_path=str(tmp_path),
+        base_branch="main",
+        repo_url="https://github.com/boathell/existing.git",
+    )
+    assert result.pr_url.endswith("/pull/100")
+    assert any(cmd[:2] == ["git", "commit"] for cmd in calls)

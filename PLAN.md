@@ -15,6 +15,11 @@
 - M6 测试与验收: done
 
 ## Progress Log
+- 时间: 2026-03-03 14:28:34 CST
+  - 里程碑: M2/M3/M4/M6
+  - 完成内容: 对你新建 issue（`7f0ff42a-e95f-43ea-963e-1bcfa4dfaaed`）完成真实链路联调并验收：已流转到 Done，真实 GitHub PR 已创建；由于描述未按 TDD 模板填写，系统按设计回写了 `[TDD-提醒]` 降级提示（不阻断）。
+  - 证据: issue run `state=Done`、`pr_url=https://github.com/boathell/multiagent-1/pull/1`；Plane issue 状态 `Done`；Plane comments 共 4 条（含设计/编码/审查 3 条 + `[TDD-提醒]` 1 条）
+  - 下一步: 新建一条“完整 Red/Green/Refactor 模板”issue 再跑一次，验证不会出现 `[TDD-提醒]`，并在三阶段输出中看到 TDD 区块驱动痕迹。
 - 时间: 2026-03-03 13:59:10 CST
   - 里程碑: M1/M2/M6
   - 完成内容: 完成 TDD issue 模板接入：新增 TDD 文档模板与填写指南；编排器可从 Plane issue 描述提取并解析 Red/Green/Refactor/验收标准；TDD 上下文已注入 Kimi/Codex/Gemini 三阶段提示词；缺少关键段落时以中文 `[TDD-提醒]` 评论降级提示（不阻断）。
