@@ -1,0 +1,14 @@
+projects:
+  5316280a-ada0-44af-8c7d-3b1408e796a0:
+    repo_url: https://github.com/boathell/multiagent.git
+    local_path: /Volumes/exFAT/multiagent
+    base_branch: main
+    state_map:
+      Todo: Todo
+      Design: In Progress
+      Coding: In Progress
+      Review: In Progress
+      Done: Done
+      Blocked: Backlog
+    checks:
+      - "uv run pytest -q"

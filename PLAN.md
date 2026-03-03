@@ -1,0 +1,112 @@
+## Baseline Plan
+- 在 `/Volumes/exFAT/multiagent` 初始化 `Python + uv` 项目，构建 Plane 驱动的编排器。
+- 固定流程：`Todo -> Design(Claude) -> Coding(Codex) -> Review(Gemini) -> Done`。
+- 先用 Mock Agent 跑通主链路：Plane Issue -> GitHub PR -> Plane 更新 -> Plane Webhook -> 飞书通知。
+- GitHub 采用 `PR 创建后人工确认合并`。
+- 每阶段失败自动重试 1 次，仍失败则挂起并通知。
+
+## Milestones
+- M0 初始化工程: done
+- M1 核心状态机与编排器: done
+- M2 Agent 执行层（Mock）: done
+- M3 GitHub 集成与质量门禁: done
+- M4 Plane 集成与 Webhook 入站: done
+- M5 通知链路（Plane Webhook -> 飞书）: done
+- M6 测试与验收: done
+
+## Progress Log
+- 时间: 2026-03-03 12:20:03 CST
+  - 里程碑: M1/M4/M6
+  - 完成内容: 按确认完成失败重试/阻塞原因的中文评论模板：失败阶段评论增加“原因”字段；失败重试时新增“重试中”评论；进入 Blocked 时新增“已阻塞+处理建议”评论，均保留 `[ORCH]` 结构化行。
+  - 证据: `/Volumes/exFAT/multiagent/src/app/orchestrator.py`、`/Volumes/exFAT/multiagent/tests/test_orchestrator.py`、`uv run pytest -q -> 28 passed`、`curl http://127.0.0.1:8787/healthz -> {\"ok\":true}`
+  - 下一步: 新建一个故意失败的 issue（例如让 review 返回 NEEDS_CHANGES 两轮）验证 Plane 中文“重试中/已阻塞”评论的实际展示效果。
+- 时间: 2026-03-03 12:16:07 CST
+  - 里程碑: M1/M4/M6
+  - 完成内容: 新增 Plane 中文评论能力并完成真实 issue 验证：阶段评论改为中文可读（保留机器可解析元数据）；兼容中文评论通知解析；你新建的 issue（`0838d4e2-d07b-4b99-8d81-47cb0ab9395b`）已从 Todo 流转到 Done，Plane 中已显示中文评论。
+  - 证据: `/Volumes/exFAT/multiagent/src/app/orchestrator.py`、`/Volumes/exFAT/multiagent/src/app/api/webhooks.py`、`/Volumes/exFAT/multiagent/tests/test_orchestrator.py`、`/Volumes/exFAT/multiagent/tests/test_webhook_notify.py`、`uv run pytest -q -> 26 passed`、Plane comments 出现 `[编排器] | 阶段：设计/编码/审查` 三条记录
+  - 下一步: 若你确认格式 OK，我继续把 `state` 轨迹提示和失败重试提示也统一改成中文（目前主要是阶段评论中文）。
+- 时间: 2026-03-03 11:44:38 CST
+  - 里程碑: M1/M2/M6
+  - 完成内容: 完成运行稳定性加固并处理你新建 issue（`099673ea-d789-473e-bc4c-e9ccae13caed`）：修复 CLI 超时后子进程残留、修复 retry 并发竞争、将 Plane 状态回写改为同步等待；当前该 issue 已完成到 Done。
+  - 证据: `/Volumes/exFAT/multiagent/src/app/adapters/agents/cli_adapter.py`、`/Volumes/exFAT/multiagent/src/app/orchestrator.py`、`/Volumes/exFAT/multiagent/tests/test_cli_agent_adapter.py`、`/Volumes/exFAT/multiagent/tests/test_orchestrator.py`、`uv run pytest -q -> 24 passed`、Plane work item `099673ea-d789-473e-bc4c-e9ccae13caed` 当前 `state=Done`
+  - 下一步: 用同一流程再创建 1 个真实 issue 做回归，确认不再出现重复评论/并发 retry，并评估是否切换 `GITHUB_USE_MOCK=false` 接入真实 PR。
+- 时间: 2026-03-03 11:10:08 CST
+  - 里程碑: M2
+  - 完成内容: 对你新建的真实 issue（`099673ea-d789-473e-bc4c-e9ccae13caed`）完成非 Mock 三阶段联调：Kimi 设计成功、Codex 编码成功（Mock GitHub PR 链接已回写）、Gemini 审查两次失败后按策略进入 Blocked。
+  - 证据: issue trace 显示 `design:success -> coding:success -> review:failed(retry x2)`；Plane 评论 3 条 ORCH 记录；最终状态映射为 `Backlog`（对应 Blocked）
+  - 下一步: 修复 Gemini CLI 环境（`TypeError: fetch failed`，常见为未登录或网络配置问题）后调用 `/internal/issues/{issue_id}/retry` 继续。
+- 时间: 2026-03-03 10:48:09 CST
+  - 里程碑: M2
+  - 完成内容: 完成真实 Agent CLI 适配并切换到非 Mock：Design 使用 `kimi-cli`，Coding 使用 `codex`，Review 使用 `gemini`；新增 CLI 适配与容错测试，服务已加载 `CliAgentAdapter`。
+  - 证据: `/Volumes/exFAT/multiagent/src/app/adapters/agents/cli_adapter.py`、`/Volumes/exFAT/multiagent/src/app/main.py`、`/Volumes/exFAT/multiagent/config/agents.yaml`、`/Volumes/exFAT/multiagent/.env`、`uv run pytest` -> `20 passed`
+  - 下一步: 用真实新 issue 触发一次完整链路，确认三种 CLI 的提示词与返回格式满足预期（特别是 review 的 NEEDS_CHANGES 判定）。
+- 时间: 2026-03-03 10:30:25 CST
+  - 里程碑: M4
+  - 完成内容: 已修复状态映射与 webhook 解析后，使用真实新建 work item 完成端到端验证：`work_item.created` 触发后状态成功推进到 `Done`，并回写 3 条 ORCH 评论。
+  - 证据: 新建 `work_item.id=aea52b07-76e2-4512-a84a-a45549dedd25`；`POST /webhooks/plane` -> accepted；Plane API 查询 `ITEM_STATE_NAME=Done`、`COMMENTS_COUNT=3`
+  - 下一步: 将该流程接入你后续真实 agent CLI（非 Mock）并配置仓库质量门禁命令。
+- 时间: 2026-03-03 10:23:13 CST
+  - 里程碑: M4
+  - 完成内容: 已使用 Plane 实际 work item（`01204567-21a2-4add-8748-ff86d0bbbbd4`）完成 webhook 真实联调；主入口返回 accepted，且 issue 写入 3 条 ORCH 评论（design/coding/review）。
+  - 证据: `POST /webhooks/plane` -> `{\"ok\":true,\"result\":{\"status\":\"accepted\"...}}`；Plane API 查询 comments `COUNT=3`，最新评论为 review success
+  - 下一步: 按你的工作流在 Plane 中配置 `Todo/Design/Coding/Review/Done` 状态映射，避免当前项目默认 `Backlog` 与编排状态名不一致。
+- 时间: 2026-03-03 10:19:14 CST
+  - 里程碑: M4
+  - 完成内容: 修复 Plane 鉴权方式为 `X-API-Key`，并新增 PlaneClient 单测；同步加固测试夹具避免读取外部 Plane 环境变量导致回归。
+  - 证据: `/Volumes/exFAT/multiagent/src/app/adapters/plane_client.py`、`/Volumes/exFAT/multiagent/tests/test_plane_client.py`、`/Volumes/exFAT/multiagent/tests/conftest.py`、`uv run pytest` -> `15 passed`
+  - 下一步: 在 Plane 后台真实创建 issue 后执行一次端到端 webhook 验证（状态流转与评论回写）。
+- 时间: 2026-03-03 10:15:08 CST
+  - 里程碑: M4
+  - 完成内容: 按要求使用 `localhost` 重启服务并设置 `NO_PROXY=localhost,127.0.0.1` 后重测；已消除 SSL 代理问题，`/webhooks/plane`（非触发）与 `/webhooks/plane/relay` 返回 200，触发型事件返回 500 的原因变为 Plane 侧 404（测试 work item 不存在）。
+  - 证据: `healthz` 返回 `{\"ok\":true}`；`POST /webhooks/plane`(Done) -> 200 ignored；`POST /webhooks/plane/relay` -> `{\"ok\":true,\"sent\":false}`；`.data/uvicorn.log` 显示 `Plane add comment failed: 404`
+  - 下一步: 在 Plane 新建真实 work item 后触发 webhook 进行端到端验证。
+- 时间: 2026-03-03 10:08:42 CST
+  - 里程碑: M4
+  - 完成内容: 使用 `.env` 配置完成 webhook 冒烟测试：`/webhooks/plane`（非触发事件）返回 200，`/webhooks/plane/relay` 返回 `sent:false`；触发型事件返回 500，定位为 Plane API 调用受代理环境影响（SSL record layer failure）。
+  - 证据: `POST /webhooks/plane` -> `{\"ok\":true,\"result\":{\"status\":\"ignored\"...}}`；`POST /webhooks/plane/relay` -> `{\"ok\":true,\"sent\":false}`；`.data/uvicorn.log` 错误栈与 `http_proxy/https_proxy/all_proxy` 环境变量
+  - 下一步: 为服务进程增加 `NO_PROXY=localhost,127.0.0.1,host.docker.internal` 后重测触发型事件。
+- 时间: 2026-03-03 10:04:18 CST
+  - 里程碑: M4
+  - 完成内容: 已在 GitHub 创建 `boathell/multiagent` 公共仓库，并更新项目映射的 `repo_url` 与 `local_path`。
+  - 证据: `gh repo create boathell/multiagent --public`；`/Volumes/exFAT/multiagent/config/projects.yaml`
+  - 下一步: 在 Plane 配置 `/webhooks/plane` 后触发 issue 验证自动流转。
+- 时间: 2026-03-03 09:55:17 CST
+  - 里程碑: M5
+  - 完成内容: 已重启服务并验证飞书通知关闭生效，`/webhooks/plane/relay` 返回 `sent:false`。
+  - 证据: `curl http://127.0.0.1:8787/healthz` -> `{\"ok\":true}`；`POST /webhooks/plane/relay` -> `{\"ok\":true,\"sent\":false}`；`lsof -i tcp:8787 -sTCP:LISTEN`
+  - 下一步: 在 Plane 保留 `/webhooks/plane`，并停用 `/webhooks/plane/relay`（如已配置）。
+- 时间: 2026-03-03 09:53:37 CST
+  - 里程碑: M5
+  - 完成内容: 按配置层停用飞书通知，清空 `.env` 与 `.env.example` 中的 FEISHU webhook 配置，并更新 README 说明当前只在 Plane 查看进度。
+  - 证据: `/Volumes/exFAT/multiagent/.env`、`/Volumes/exFAT/multiagent/.env.example`、`/Volumes/exFAT/multiagent/README.md`
+  - 下一步: 重启服务并验证 webhook 编排正常且不再发送飞书消息。
+- 时间: 2026-03-03 01:49:52 CST
+  - 里程碑: M6
+  - 完成内容: 增加应用可启动烟测，确认 FastAPI app 可被正确加载。
+  - 证据: `PYTHONPATH=src uv run python -c \"from app.main import app; print(app.title)\"` -> `multiagent-orchestrator`
+  - 下一步: 使用真实凭据联调 Plane webhook 与 GitHub PR 创建流程。
+- 时间: 2026-03-03 01:48:52 CST
+  - 里程碑: M6
+  - 完成内容: 增加 `.gitignore` 并清理缓存/系统文件后复跑测试，确保仓库输出更干净可提交。
+  - 证据: `.gitignore`、`uv run pytest` -> `13 passed in 0.75s`
+  - 下一步: 填入真实 Plane/GitHub/Feishu 配置并做联调。
+- 时间: 2026-03-03 01:47:36 CST
+  - 里程碑: M6
+  - 完成内容: 完成单元与集成测试并通过，覆盖状态机、幂等、Happy path、失败路径、通知提取与 API 端点。
+  - 证据: `uv run pytest` -> `13 passed in 0.31s`
+  - 下一步: 对接真实 Plane/GitHub/Agent CLI 配置并进行联调演示。
+- 时间: 2026-03-03 01:45:44 CST
+  - 里程碑: M5
+  - 完成内容: 完成 Plane webhook 路由与 Feishu relay 逻辑，支持关键节点消息提取（开始/PR/Review/Done/Blocked）。
+  - 证据: `src/app/api/webhooks.py`、`src/app/notify/feishu.py`
+  - 下一步: 完成测试编写与执行。
+- 时间: 2026-03-03 01:45:44 CST
+  - 里程碑: M4
+  - 完成内容: 完成 Plane client 与 webhook 驱动 orchestrator 的接入，实现事件幂等与 issue 解析。
+  - 证据: `src/app/adapters/plane_client.py`、`src/app/orchestrator.py`
+  - 下一步: 联通飞书消息过滤与发送。
+- 时间: 2026-03-03 01:45:44 CST
+  - 里程碑: M0-M3
+  - 完成内容: 初始化 uv 项目并实现状态机、Mock agent、GitHub client、质量门禁、FastAPI 主入口。
+  - 证据: `pyproject.toml`、`src/app/state_machine.py`、`src/app/adapters/agents/mock_adapter.py`、`src/app/adapters/github_client.py`、`src/app/quality_gate.py`、`src/app/main.py`
+  - 下一步: 增加测试覆盖并跑通验收。
