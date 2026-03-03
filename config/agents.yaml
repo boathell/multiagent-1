@@ -1,0 +1,28 @@
+agents:
+  claude:
+    command: "kimi-cli"
+    args:
+      - "--print"
+      - "--output-format"
+      - "text"
+      - "--final-message-only"
+      - "-p"
+    prompt_mode: "arg"
+    timeout_sec: 300
+  codex:
+    command: "codex"
+    args:
+      - "exec"
+      - "--skip-git-repo-check"
+      - "-"
+    prompt_mode: "stdin"
+    timeout_sec: 600
+  gemini:
+    command: "gemini"
+    args:
+      - "-p"
+    prompt_mode: "arg"
+    timeout_sec: 300
+
+tdd_enabled: true
+use_mock: false
