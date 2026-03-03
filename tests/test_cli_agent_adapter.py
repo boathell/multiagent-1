@@ -120,12 +120,22 @@ async def test_cli_adapter_arg_prompt_and_cwd(tmp_path: Path):
 def test_cli_adapter_build_prompt_contains_tdd_sections():
     prompt = CliAgentAdapter._build_prompt(Stage.CODING, _ctx())
     assert "TDD Template Context:" in prompt
+    assert "Respond in Simplified Chinese" in prompt
     assert "TDD_RED:" in prompt
     assert "TDD_GREEN:" in prompt
     assert "TDD_REFACTOR:" in prompt
     assert "RED_RESULT" in prompt
     assert "GREEN_RESULT" in prompt
     assert "REFACTOR_NOTE" in prompt
+
+
+def test_cli_adapter_design_prompt_requires_tdd_sections():
+    prompt = CliAgentAdapter._build_prompt(Stage.DESIGN, _ctx())
+    assert "### Red 阶段" in prompt
+    assert "### Green 阶段" in prompt
+    assert "### Refactor 阶段" in prompt
+    assert "### 验收标准（DoD）" in prompt
+    assert "All narrative text must be in Simplified Chinese." in prompt
 
 
 @pytest.mark.asyncio
@@ -170,5 +180,8 @@ async def test_cli_adapter_timeout_kills_process(monkeypatch: pytest.MonkeyPatch
 
     assert result.status == StageStatus.FAILED
     assert "timeout after 1s" in result.summary
+    assert result.artifacts["command"] == "gemini -p"
+    assert result.artifacts["prompt_mode"] == "arg"
+    assert result.artifacts["timeout_sec"] == 1
     assert proc.kill_called is True
     assert proc.communicate_calls >= 2

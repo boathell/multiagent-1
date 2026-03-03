@@ -30,3 +30,13 @@ def test_plane_client_enabled_requires_base_url_and_token():
 
     assert PlaneClient(ok_settings)._enabled() is True
     assert PlaneClient(missing_token)._enabled() is False
+
+
+def test_plane_client_has_description_update_api():
+    settings = Settings(
+        PLANE_BASE_URL="http://localhost:8080",
+        PLANE_WORKSPACE_SLUG="test_workspace",
+        PLANE_API_TOKEN="plane_api_test",
+    )
+    client = PlaneClient(settings)
+    assert callable(getattr(client, "update_work_item_description", None))
