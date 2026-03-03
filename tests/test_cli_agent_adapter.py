@@ -120,12 +120,42 @@ async def test_cli_adapter_arg_prompt_and_cwd(tmp_path: Path):
 def test_cli_adapter_build_prompt_contains_tdd_sections():
     prompt = CliAgentAdapter._build_prompt(Stage.CODING, _ctx())
     assert "TDD Template Context:" in prompt
+    assert "Respond in Simplified Chinese" in prompt
     assert "TDD_RED:" in prompt
     assert "TDD_GREEN:" in prompt
     assert "TDD_REFACTOR:" in prompt
     assert "RED_RESULT" in prompt
     assert "GREEN_RESULT" in prompt
     assert "REFACTOR_NOTE" in prompt
+
+
+def test_cli_adapter_design_prompt_requires_tdd_sections():
+    prompt = CliAgentAdapter._build_prompt(Stage.DESIGN, _ctx())
+    assert "### Red 阶段" in prompt
+    assert "### Green 阶段" in prompt
+    assert "### Refactor 阶段" in prompt
+    assert "### 验收标准（DoD）" in prompt
+    assert "All narrative text must be in Simplified Chinese." in prompt
+
+
+def test_cli_adapter_review_prompt_includes_diff_context():
+    ctx = _ctx()
+    ctx.metadata.update(
+        {
+            "review_changed_files": ["src/app/orchestrator.py", "tests/test_orchestrator.py"],
+            "review_diff_range": "main...plane/123",
+            "review_diff": "diff --git a/a.py b/a.py\n+print('ok')",
+        }
+    )
+    prompt = CliAgentAdapter._build_prompt(Stage.REVIEW, ctx)
+    assert "Review Context:" in prompt
+    assert "Changed Files: src/app/orchestrator.py, tests/test_orchestrator.py" in prompt
+    assert "Diff Range: main...plane/123" in prompt
+    assert "Code Diff for Review:" in prompt
+    assert "```diff" in prompt
+    assert "NO tool access" not in prompt
+    assert "default to APPROVED" not in prompt
+    assert "If code diff/context is missing, return NEEDS_CHANGES" in prompt
 
 
 @pytest.mark.asyncio
@@ -170,5 +200,8 @@ async def test_cli_adapter_timeout_kills_process(monkeypatch: pytest.MonkeyPatch
 
     assert result.status == StageStatus.FAILED
     assert "timeout after 1s" in result.summary
+    assert result.artifacts["command"] == "gemini -p"
+    assert result.artifacts["prompt_mode"] == "arg"
+    assert result.artifacts["timeout_sec"] == 1
     assert proc.kill_called is True
     assert proc.communicate_calls >= 2

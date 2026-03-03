@@ -4,6 +4,7 @@ import asyncio
 import html
 import logging
 import re
+import subprocess
 from typing import Any
 
 from app.config import AppConfig
@@ -164,19 +165,6 @@ class Orchestrator:
             )
             return
 
-        issue_description = str(existing.get("description", ""))
-        tdd_sections = self.parse_tdd_sections(issue_description)
-        missing_sections = self._tdd_missing_sections(tdd_sections)
-        if missing_sections and not self._has_tdd_reminder(issue_id):
-            labels = {"red": "Red", "green": "Green", "refactor": "Refactor"}
-            missing_names = ", ".join(labels.get(x, x) for x in missing_sections)
-            tdd_msg = (
-                "[TDD-提醒] 缺少 Red/Green/Refactor 段落，已按降级模式执行。"
-                f" 当前缺失: {missing_names}"
-            )
-            self.store.append_trace(issue_id, stage="tdd", status="reminder", message=tdd_msg)
-            await self.plane_client.add_comment(project_id=project_id, issue_id=issue_id, comment=tdd_msg)
-
         while True:
             stage = stage_for_state(current_state)
             if stage is None:
@@ -184,6 +172,40 @@ class Orchestrator:
 
             result = await self._run_stage_with_retry(stage, issue_id, project_id, title, project)
             next_pipeline_state = next_state(current_state, result.status)
+
+            if stage == Stage.DESIGN and result.status == StageStatus.SUCCESS:
+                issue_record = self.store.get_issue(issue_id) or {}
+                current_desc = str(issue_record.get("description", ""))
+                generated_sections = self._extract_tdd_sections_from_stage_result(result)
+                merged_desc, merged_sections, merged = self._merge_tdd_sections(
+                    base_description=current_desc,
+                    generated_sections=generated_sections,
+                )
+                if merged:
+                    self.store.update_issue_fields(issue_id, description=merged_desc)
+                    result.artifacts["tdd_autofill"] = {
+                        k: bool(v.strip()) for k, v in generated_sections.items()
+                    }
+                    await self._sync_plane_description(
+                        project_id=project_id,
+                        issue_id=issue_id,
+                        description=merged_desc,
+                    )
+
+                missing_sections = self._tdd_missing_sections(merged_sections)
+                if missing_sections and not self._has_tdd_reminder(issue_id):
+                    labels = {"red": "Red", "green": "Green", "refactor": "Refactor"}
+                    missing_names = ", ".join(labels.get(x, x) for x in missing_sections)
+                    tdd_msg = (
+                        "[TDD-提醒] 设计阶段未补全 Red/Green/Refactor，已按降级模式执行。"
+                        f" 当前缺失: {missing_names}"
+                    )
+                    self.store.append_trace(issue_id, stage="tdd", status="reminder", message=tdd_msg)
+                    await self.plane_client.add_comment(
+                        project_id=project_id,
+                        issue_id=issue_id,
+                        comment=tdd_msg,
+                    )
 
             if stage == Stage.REVIEW and result.status == StageStatus.NEEDS_CHANGES:
                 issue_record = self.store.get_issue(issue_id)
@@ -261,6 +283,14 @@ class Orchestrator:
                 review_loops=int(issue.get("review_loops", 0)),
                 tdd_sections=self.parse_tdd_sections(str(issue.get("description", ""))),
             )
+            if stage == Stage.REVIEW:
+                context.metadata.update(
+                    self._collect_review_context(
+                        local_path=project.local_path,
+                        base_branch=project.base_branch,
+                        branch=context.branch,
+                    )
+                )
 
             self.store.update_issue_fields(issue_id, last_stage=stage.value)
             result = await self.agent_adapter.run_stage(stage, context)
@@ -346,6 +376,23 @@ class Orchestrator:
                 exc,
             )
 
+    async def _sync_plane_description(self, project_id: str, issue_id: str, description: str) -> None:
+        update_fn = getattr(self.plane_client, "update_work_item_description", None)
+        if not callable(update_fn):
+            return
+        try:
+            await update_fn(
+                project_id=project_id,
+                issue_id=issue_id,
+                description_html=self._description_to_html(description),
+            )
+        except Exception as exc:  # noqa: BLE001
+            self.logger.warning(
+                "Plane description update failed: issue_id=%s err=%s",
+                issue_id,
+                exc,
+            )
+
     @staticmethod
     def _build_stage_comment(stage: Stage, result: StageResult) -> str:
         stage_zh_map = Orchestrator._stage_zh_map()
@@ -355,10 +402,10 @@ class Orchestrator:
             "[编排器]",
             f"阶段：{stage_zh_map.get(stage, stage.value)}",
             f"状态：{status_zh_map.get(result.status, result.status.value)}",
+            f"摘要：{Orchestrator._human_stage_summary(stage, result.status)}",
         ]
         if result.status in {StageStatus.FAILED, StageStatus.NEEDS_CHANGES}:
             human_parts.append(f"原因：{Orchestrator._format_reason(result.summary, result.status)}")
-        human_parts.append(f"摘要：{result.summary}")
         if result.artifacts.get("pr_url"):
             human_parts.append(f"PR：{result.artifacts['pr_url']}")
 
@@ -378,9 +425,9 @@ class Orchestrator:
             "[编排器]",
             f"阶段：{Orchestrator._stage_zh_map().get(stage, stage.value)}",
             "状态：重试中",
+            "摘要：阶段失败后自动重试",
             f"原因：{Orchestrator._format_reason(summary, StageStatus.FAILED)}",
             f"尝试：{attempt}/{total_attempts}",
-            f"摘要：{summary}",
         ]
         machine_parts = [
             "[ORCH]",
@@ -398,9 +445,9 @@ class Orchestrator:
             "[编排器]",
             f"阶段：{Orchestrator._stage_zh_map().get(stage, stage.value)}",
             "状态：已阻塞",
+            "摘要：达到失败上限，流程暂停",
             f"原因：{Orchestrator._format_reason(result.summary, result.status)}",
             "处理：请修复后调用 internal retry 接口或在 Plane 中重新触发。",
-            f"摘要：{result.summary}",
         ]
         machine_parts = [
             "[ORCH]",
@@ -425,6 +472,18 @@ class Orchestrator:
             StageStatus.FAILED: "失败",
             StageStatus.NEEDS_CHANGES: "需修改",
         }
+
+    @staticmethod
+    def _human_stage_summary(stage: Stage, status: StageStatus) -> str:
+        if status == StageStatus.SUCCESS:
+            if stage == Stage.DESIGN:
+                return "设计阶段执行成功"
+            if stage == Stage.CODING:
+                return "编码阶段执行成功"
+            return "审查阶段执行成功"
+        if status == StageStatus.NEEDS_CHANGES:
+            return "审查未通过，需要修改后重试"
+        return "阶段执行失败"
 
     @staticmethod
     def _format_reason(summary: str, status: StageStatus) -> str:
@@ -536,6 +595,9 @@ class Orchestrator:
             marker = Orchestrator._detect_tdd_section_marker(line)
             if marker:
                 current = marker
+                inline_content = Orchestrator._extract_inline_tdd_section_content(line, marker)
+                if inline_content:
+                    buffers[current].append(inline_content)
                 continue
             if current:
                 buffers[current].append(raw_line.rstrip())
@@ -554,15 +616,58 @@ class Orchestrator:
         if not cleaned:
             return None
 
-        if "red" in cleaned and ("阶段" in cleaned or "stage" in cleaned or cleaned.startswith("red")):
+        if re.match(r"^tdd[\s_-]*red(?:\s*[:：].*)?$", cleaned):
             return "red"
-        if "green" in cleaned and ("阶段" in cleaned or "stage" in cleaned or cleaned.startswith("green")):
+        if Orchestrator._matches_tdd_stage_heading(cleaned, "red"):
+            return "red"
+        if cleaned.startswith("red_result") or cleaned.startswith("red_stage"):
+            return "red"
+        if re.match(r"^tdd[\s_-]*green(?:\s*[:：].*)?$", cleaned):
             return "green"
-        if "refactor" in cleaned or "重构阶段" in cleaned or cleaned.startswith("refactor"):
+        if Orchestrator._matches_tdd_stage_heading(cleaned, "green"):
+            return "green"
+        if cleaned.startswith("green_result") or cleaned.startswith("green_stage"):
+            return "green"
+        if re.match(r"^tdd[\s_-]*refactor(?:\s*[:：].*)?$", cleaned):
             return "refactor"
-        if "验收标准" in cleaned or "acceptance criteria" in cleaned or cleaned == "dod":
+        if Orchestrator._matches_tdd_stage_heading(cleaned, "refactor"):
+            return "refactor"
+        if cleaned.startswith("重构阶段"):
+            return "refactor"
+        if cleaned.startswith("refactor_note") or cleaned.startswith("refactor_stage"):
+            return "refactor"
+        if re.match(r"^tdd[\s_-]*acceptance(?:\s*[:：].*)?$", cleaned):
+            return "acceptance"
+        if cleaned.startswith("验收标准") or cleaned.startswith("acceptance criteria") or cleaned == "dod":
+            return "acceptance"
+        if cleaned.startswith("acceptance") or cleaned.startswith("dod"):
             return "acceptance"
         return None
+
+    @staticmethod
+    def _extract_inline_tdd_section_content(line: str, marker: str) -> str:
+        token_map = {
+            "red": (r"tdd[\s_-]*red", r"red_result", r"red_stage"),
+            "green": (r"tdd[\s_-]*green", r"green_result", r"green_stage"),
+            "refactor": (r"tdd[\s_-]*refactor", r"refactor_note", r"refactor_stage"),
+            "acceptance": (r"tdd[\s_-]*acceptance", r"acceptance(?:\s+criteria)?", r"dod"),
+        }
+        for token in token_map.get(marker, ()):
+            matched = re.match(rf"(?i)^[\s#>*`\-0-9\.\)\(]*{token}\s*[:：]\s*(.+)$", line.strip())
+            if not matched:
+                continue
+            content = matched.group(1).strip()
+            if content.lower() in {"(missing)", "missing", "n/a", "na", "none"}:
+                return ""
+            return content
+        return ""
+
+    @staticmethod
+    def _matches_tdd_stage_heading(cleaned: str, token: str) -> bool:
+        if cleaned in {token, f"{token}:", f"{token}："}:
+            return True
+        pattern = rf"^{re.escape(token)}(?:\s*(?:阶段|stage).*)?$"
+        return bool(re.match(pattern, cleaned))
 
     @staticmethod
     def _tdd_missing_sections(tdd_sections: dict[str, str]) -> list[str]:
@@ -572,6 +677,168 @@ class Orchestrator:
     def _has_tdd_reminder(self, issue_id: str) -> bool:
         traces = self.store.get_trace(issue_id)
         return any(t.get("stage") == "tdd" and t.get("status") == "reminder" for t in traces)
+
+    @staticmethod
+    def _extract_tdd_sections_from_stage_result(result: StageResult) -> dict[str, str]:
+        stdout = str(result.artifacts.get("stdout", "")).strip()
+        if not stdout:
+            return {"red": "", "green": "", "refactor": "", "acceptance": ""}
+        return Orchestrator.parse_tdd_sections(stdout)
+
+    @staticmethod
+    def _merge_tdd_sections(
+        base_description: str,
+        generated_sections: dict[str, str],
+    ) -> tuple[str, dict[str, str], bool]:
+        normalized_base = base_description.strip()
+        base_sections = Orchestrator.parse_tdd_sections(normalized_base)
+        section_labels = {
+            "red": "Red 阶段",
+            "green": "Green 阶段",
+            "refactor": "Refactor 阶段",
+            "acceptance": "验收标准（DoD）",
+        }
+
+        appended_parts: list[str] = []
+        for key in ("red", "green", "refactor", "acceptance"):
+            original = str(base_sections.get(key, "")).strip()
+            generated = str(generated_sections.get(key, "")).strip()
+            if original or not generated:
+                continue
+            appended_parts.append(f"### {section_labels[key]}\n{generated}")
+
+        if not appended_parts:
+            return normalized_base, base_sections, False
+
+        chunks = [normalized_base] if normalized_base else []
+        chunks.extend(appended_parts)
+        merged_description = "\n\n".join(chunks).strip()
+        merged_sections = Orchestrator.parse_tdd_sections(merged_description)
+        return merged_description, merged_sections, True
+
+    @staticmethod
+    def _description_to_html(description: str) -> str:
+        lines = description.splitlines()
+        parts: list[str] = []
+        list_items: list[str] = []
+
+        def flush_list() -> None:
+            nonlocal list_items
+            if not list_items:
+                return
+            li = "".join(f"<li>{html.escape(item)}</li>" for item in list_items)
+            parts.append(f"<ul>{li}</ul>")
+            list_items = []
+
+        for raw in lines:
+            line = raw.strip()
+            if not line:
+                flush_list()
+                continue
+
+            if line.startswith("- "):
+                list_items.append(line[2:].strip())
+                continue
+
+            flush_list()
+            heading = re.match(r"^(#{1,6})\s+(.+)$", line)
+            if heading:
+                level = len(heading.group(1))
+                text = heading.group(2).strip()
+                parts.append(f"<h{level}>{html.escape(text)}</h{level}>")
+                continue
+            parts.append(f"<p>{html.escape(line)}</p>")
+
+        flush_list()
+        return "".join(parts) if parts else "<p></p>"
+
+    @staticmethod
+    def _run_git(local_path: str, args: list[str]) -> tuple[bool, str]:
+        try:
+            completed = subprocess.run(
+                args,
+                cwd=local_path,
+                check=False,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+        except Exception as exc:  # noqa: BLE001
+            return False, str(exc)
+        output = "\n".join(x for x in [completed.stdout, completed.stderr] if x).strip()
+        if completed.returncode != 0:
+            return False, output or f"exit={completed.returncode}"
+        return True, output.strip()
+
+    def _collect_review_context(self, local_path: str, base_branch: str, branch: str) -> dict[str, Any]:
+        meta: dict[str, Any] = {
+            "review_base_branch": base_branch,
+            "review_branch": branch,
+            "review_changed_files": [],
+            "review_diff": "",
+            "review_diff_range": "",
+            "review_diff_truncated": False,
+        }
+        if not local_path:
+            meta["review_context_error"] = "workspace path is empty"
+            return meta
+
+        ok_git, _ = self._run_git(local_path, ["git", "rev-parse", "--is-inside-work-tree"])
+        if not ok_git:
+            meta["review_context_error"] = f"not a git repo: {local_path}"
+            return meta
+
+        ok_head, head_branch = self._run_git(local_path, ["git", "rev-parse", "--abbrev-ref", "HEAD"])
+        if ok_head and head_branch and not meta["review_branch"]:
+            meta["review_branch"] = head_branch
+
+        branch_ref = str(meta["review_branch"] or "").strip()
+        range_candidates: list[str] = []
+        if branch_ref and branch_ref != "HEAD":
+            range_candidates.extend(
+                [
+                    f"origin/{base_branch}...{branch_ref}",
+                    f"{base_branch}...{branch_ref}",
+                    f"origin/{base_branch}..{branch_ref}",
+                    f"{base_branch}..{branch_ref}",
+                ]
+            )
+        range_candidates.extend(["origin/HEAD..HEAD", "HEAD~1..HEAD"])
+
+        chosen_range = ""
+        changed_files: list[str] = []
+        diff_text = ""
+        last_error = ""
+        for rng in range_candidates:
+            ok_files, files_out = self._run_git(local_path, ["git", "diff", "--name-only", rng])
+            ok_diff, diff_out = self._run_git(local_path, ["git", "diff", "--no-color", rng])
+            if not ok_files or not ok_diff:
+                last_error = files_out if not ok_files else diff_out
+                continue
+            chosen_range = rng
+            changed_files = [x.strip() for x in files_out.splitlines() if x.strip()]
+            diff_text = diff_out
+            break
+
+        if not chosen_range:
+            ok_files, files_out = self._run_git(local_path, ["git", "diff", "--name-only"])
+            ok_diff, diff_out = self._run_git(local_path, ["git", "diff", "--no-color"])
+            if ok_files and ok_diff:
+                chosen_range = "working-tree"
+                changed_files = [x.strip() for x in files_out.splitlines() if x.strip()]
+                diff_text = diff_out
+            else:
+                meta["review_context_error"] = last_error or files_out or diff_out or "failed to collect diff"
+                return meta
+
+        max_chars = 120_000
+        meta["review_diff_range"] = chosen_range
+        meta["review_changed_files"] = changed_files
+        meta["review_diff_truncated"] = len(diff_text) > max_chars
+        meta["review_diff"] = diff_text[:max_chars]
+        if not diff_text.strip():
+            meta["review_context_error"] = "empty diff"
+        return meta
 
     @staticmethod
     def should_start_pipeline(event_type: str, issue_data: dict[str, str]) -> bool:

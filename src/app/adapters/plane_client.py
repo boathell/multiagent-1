@@ -124,3 +124,26 @@ class PlaneClient:
                 raise RuntimeError(
                     f"Plane add comment failed: {response.status_code} {response.text}"
                 )
+
+    async def update_work_item_description(
+        self,
+        project_id: str,
+        issue_id: str,
+        description_html: str,
+    ) -> None:
+        if not self._enabled():
+            self._logger.info("Plane disabled, skip description update issue_id=%s", issue_id)
+            return
+
+        workspace = self._settings.plane_workspace_slug
+        endpoint = (
+            f"{self._settings.plane_base_url}/api/v1/workspaces/{workspace}"
+            f"/projects/{project_id}/work-items/{issue_id}/"
+        )
+        payload = {"description_html": description_html}
+        async with httpx.AsyncClient(timeout=15, trust_env=False) as client:
+            response = await client.patch(endpoint, headers=self._headers(), json=payload)
+            if response.status_code >= 300:
+                raise RuntimeError(
+                    f"Plane update description failed: {response.status_code} {response.text}"
+                )

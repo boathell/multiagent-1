@@ -43,6 +43,7 @@ class CliAgentAdapter:
         prompt_mode = str(cfg.get("prompt_mode", "stdin")).lower()
         context.metadata["tdd_enabled"] = self._tdd_enabled
         prompt = self._build_prompt(stage, context)
+        command_line = " ".join([command, *args]).strip()
 
         cmd_parts = shlex.split(command)
         if not cmd_parts:
@@ -80,16 +81,37 @@ class CliAgentAdapter:
             return StageResult(
                 status=StageStatus.FAILED,
                 summary=f"{agent_name} timeout after {timeout_sec}s.",
+                artifacts={
+                    "agent": agent_name,
+                    "command": command_line,
+                    "prompt_mode": prompt_mode,
+                    "timeout_sec": timeout_sec,
+                    "cwd": context.local_path,
+                },
             )
         except FileNotFoundError:
             return StageResult(
                 status=StageStatus.FAILED,
                 summary=f"{agent_name} command not found: {cmd_parts[0]}",
+                artifacts={
+                    "agent": agent_name,
+                    "command": command_line,
+                    "prompt_mode": prompt_mode,
+                    "timeout_sec": timeout_sec,
+                    "cwd": context.local_path,
+                },
             )
         except Exception as exc:  # noqa: BLE001
             return StageResult(
                 status=StageStatus.FAILED,
                 summary=f"{agent_name} execution error: {exc}",
+                artifacts={
+                    "agent": agent_name,
+                    "command": command_line,
+                    "prompt_mode": prompt_mode,
+                    "timeout_sec": timeout_sec,
+                    "cwd": context.local_path,
+                },
             )
 
         out = (stdout or b"").decode("utf-8", errors="replace").strip()
@@ -105,6 +127,10 @@ class CliAgentAdapter:
                 "exit_code": proc.returncode or 0,
                 "stdout": out[:2000],
                 "stderr": err[:2000],
+                "command": command_line,
+                "prompt_mode": prompt_mode,
+                "timeout_sec": timeout_sec,
+                "cwd": context.local_path,
             },
         )
 
@@ -150,6 +176,7 @@ class CliAgentAdapter:
     def _build_prompt(stage: Stage, context: IssueContext) -> str:
         base = [
             "You are an execution agent in a multi-agent pipeline.",
+            "Respond in Simplified Chinese unless strict control tokens are required.",
             f"Stage: {stage.value}",
             f"Issue ID: {context.issue_id}",
             f"Project ID: {context.project_id}",
@@ -162,24 +189,29 @@ class CliAgentAdapter:
 
         if stage == Stage.DESIGN:
             base.append(
-                "Use TDD-first planning. Evaluate whether RED tests are sufficient before implementation."
+                "You own test and implementation design. If Red/Green/Refactor content is missing, generate it."
             )
-            base.append("Output concise sections: RED_COVERAGE, GAPS, RISKS, ACCEPTANCE.")
+            base.append("All narrative text must be in Simplified Chinese.")
+            base.append(
+                "Output markdown headings exactly: ### Red 阶段, ### Green 阶段, "
+                "### Refactor 阶段, ### 验收标准（DoD）."
+            )
+            base.append("Also include concise GAPS and RISKS bullet points.")
         elif stage == Stage.CODING:
             base.append(
                 "Follow TDD sequence strictly: RED (failing tests) -> GREEN (minimal implementation) -> REFACTOR."
             )
+            base.append("All narrative text must be in Simplified Chinese.")
             base.append("Output concise sections: RED_RESULT, GREEN_RESULT, REFACTOR_NOTE, CHANGED_FILES.")
         else:
+            base.extend(CliAgentAdapter._review_context_lines(context))
             base.append(
                 "Review the changes and output first line exactly one token: APPROVED or NEEDS_CHANGES."
             )
-            base.append("You have NO tool access and NO filesystem access in this run. Do NOT call tools.")
+            base.append("From the second line onward, write in Simplified Chinese.")
+            base.append("You should perform strict code review based on provided git diff and changed files.")
             base.append("Verify TDD evidence completeness and that RED->GREEN->REFACTOR order is respected.")
-            base.append(
-                "If concrete code diff is missing, perform lightweight process review and default to APPROVED; "
-                "use NEEDS_CHANGES only for clear blockers shown in the prompt."
-            )
+            base.append("If code diff/context is missing, return NEEDS_CHANGES and explain missing evidence.")
             base.append("Then explain concise reasons and actionable fixes.")
 
         return "\n".join(base)
@@ -199,4 +231,34 @@ class CliAgentAdapter:
                 lines.append(f"TDD_{key.upper()}: {value[:800]}")
             else:
                 lines.append(f"TDD_{key.upper()}: (missing)")
+        return lines
+
+    @staticmethod
+    def _review_context_lines(context: IssueContext) -> list[str]:
+        lines = ["Review Context:"]
+        changed_files = context.metadata.get("review_changed_files")
+        if isinstance(changed_files, list) and changed_files:
+            joined = ", ".join(str(x) for x in changed_files[:80])
+            lines.append(f"Changed Files: {joined}")
+        else:
+            lines.append("Changed Files: (none)")
+
+        diff_range = str(context.metadata.get("review_diff_range", "")).strip()
+        if diff_range:
+            lines.append(f"Diff Range: {diff_range}")
+
+        diff_text = str(context.metadata.get("review_diff", "")).strip()
+        if diff_text:
+            lines.append("Code Diff for Review:")
+            lines.append("```diff")
+            lines.append(diff_text)
+            lines.append("```")
+            if context.metadata.get("review_diff_truncated"):
+                lines.append("Diff Notice: truncated due to size; treat as partial evidence.")
+        else:
+            lines.append("Code Diff for Review: (missing)")
+
+        err = str(context.metadata.get("review_context_error", "")).strip()
+        if err:
+            lines.append(f"Review Context Error: {err}")
         return lines
