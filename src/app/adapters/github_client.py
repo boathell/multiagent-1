@@ -254,3 +254,11 @@ class GitHubClient:
             else:
                 raise RuntimeError(f"Failed to create PR for branch {branch}: {pr_output}")
         return PullRequestResult(branch=branch, pr_url=pr_url)
+
+    def add_pr_comment(self, pr_url: str, body: str, local_path: str) -> None:
+        if self._settings.github_use_mock:
+            self._logger.info("GitHub mock enabled, skip PR comment: %s", pr_url)
+            return
+        if not pr_url.strip() or not body.strip():
+            return
+        self._run(["gh", "pr", "comment", pr_url, "--body", body], cwd=local_path)

@@ -22,7 +22,10 @@ agents:
     args:
       - "-p"
     prompt_mode: "arg"
-    timeout_sec: 300
+    timeout_sec: 420
 
 tdd_enabled: true
 use_mock: false
+review:
+  max_loops: 1
+  arbiter_max_loops: 1

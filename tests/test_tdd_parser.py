@@ -6,6 +6,9 @@ import pytest
 
 from app.models import StageResult, StageStatus
 from app.tdd_parser import (
+    parse_issue_contract,
+    issue_contract_missing_fields,
+    issue_contract_score,
     detect_tdd_section_marker,
     extract_inline_tdd_section_content,
     extract_tdd_sections_from_stage_result,
@@ -369,3 +372,41 @@ N/A
     assert "Implementation detail" in sections["green"]
     assert "N/A" in sections["refactor"] or sections["refactor"] == ""
     assert "Done" in sections["acceptance"]
+
+
+def test_parse_issue_contract_complete_sections():
+    description = """
+## 背景与目标
+- 完成 webhook 幂等能力
+## 范围 / 非目标
+- 范围：仅变更 orchestrator
+## 验收标准（DoD）
+- 所有测试通过
+## 风险
+- review 可能超时
+## 回滚
+- 回滚至上一个 tag
+"""
+    contract = parse_issue_contract(description)
+    assert "webhook" in contract.goal
+    assert "orchestrator" in contract.scope
+    assert "测试通过" in contract.dod
+    assert "超时" in contract.risk
+    assert "tag" in contract.rollback
+    assert contract.score == 100
+    assert contract.missing_fields == []
+
+
+def test_parse_issue_contract_missing_sections():
+    description = """
+## 目标
+- 只给目标
+"""
+    contract = parse_issue_contract(description)
+    missing = issue_contract_missing_fields(contract)
+    assert "goal" not in missing
+    assert "scope" in missing
+    assert "dod" in missing
+    assert "risk" in missing
+    assert "rollback" in missing
+    assert issue_contract_score(contract) == 20

@@ -47,6 +47,9 @@ class SQLiteStore:
                     pr_url TEXT NOT NULL DEFAULT '',
                     attempts_json TEXT NOT NULL DEFAULT '{}',
                     review_loops INTEGER NOT NULL DEFAULT 0,
+                    arbiter_loops INTEGER NOT NULL DEFAULT 0,
+                    failure_class TEXT NOT NULL DEFAULT '',
+                    handoff_reason TEXT NOT NULL DEFAULT '',
                     last_stage TEXT NOT NULL DEFAULT '',
                     updated_at TEXT NOT NULL
                 );
@@ -73,6 +76,12 @@ class SQLiteStore:
         }
         if "description" not in cols:
             conn.execute("ALTER TABLE issue_runs ADD COLUMN description TEXT NOT NULL DEFAULT ''")
+        if "arbiter_loops" not in cols:
+            conn.execute("ALTER TABLE issue_runs ADD COLUMN arbiter_loops INTEGER NOT NULL DEFAULT 0")
+        if "failure_class" not in cols:
+            conn.execute("ALTER TABLE issue_runs ADD COLUMN failure_class TEXT NOT NULL DEFAULT ''")
+        if "handoff_reason" not in cols:
+            conn.execute("ALTER TABLE issue_runs ADD COLUMN handoff_reason TEXT NOT NULL DEFAULT ''")
 
     def is_event_processed(self, event_id: str) -> bool:
         with self._conn() as conn:
@@ -141,6 +150,9 @@ class SQLiteStore:
             "description",
             "attempts",
             "review_loops",
+            "arbiter_loops",
+            "failure_class",
+            "handoff_reason",
             "last_stage",
         }
         updates: list[str] = []

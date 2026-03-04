@@ -138,12 +138,31 @@ def test_cli_adapter_design_prompt_requires_tdd_sections():
     assert "All narrative text must be in Simplified Chinese." in prompt
 
 
+def test_cli_adapter_design_prompt_for_review_arbiter():
+    ctx = _ctx()
+    ctx.metadata.update(
+        {
+            "design_mode": "review_arbiter",
+            "review_failure_summary": "gemini timeout after 300s",
+            "review_failure_stdout": "NEEDS_CHANGES ...",
+            "review_failure_stderr": "503 unavailable",
+            "review_failure_signals": ["timeout", "api_503", "diff_truncated"],
+        }
+    )
+    prompt = CliAgentAdapter._build_prompt(Stage.DESIGN, ctx)
+    assert "Review Arbiter Context:" in prompt
+    assert "First non-empty line must be exactly one token: CONTINUE_CODING or STOP_REVIEW." in prompt
+    assert "DIAGNOSIS must be exactly one token: QUALITY_ISSUE or GEMINI_ISSUE." in prompt
+    assert "Failure Signals: timeout, api_503, diff_truncated" in prompt
+
+
 def test_cli_adapter_review_prompt_includes_diff_context():
     ctx = _ctx()
     ctx.metadata.update(
         {
             "review_changed_files": ["src/app/orchestrator.py", "tests/test_orchestrator.py"],
             "review_diff_range": "main...plane/123",
+            "review_diff_files_included": ["tests/test_orchestrator.py"],
             "review_diff": "diff --git a/a.py b/a.py\n+print('ok')",
         }
     )
@@ -151,6 +170,7 @@ def test_cli_adapter_review_prompt_includes_diff_context():
     assert "Review Context:" in prompt
     assert "Changed Files: src/app/orchestrator.py, tests/test_orchestrator.py" in prompt
     assert "Diff Range: main...plane/123" in prompt
+    assert "Diff Files Included: tests/test_orchestrator.py" in prompt
     assert "Code Diff for Review:" in prompt
     assert "```diff" in prompt
     assert "NO tool access" not in prompt

@@ -9,7 +9,7 @@ import re
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
-    from app.models import StageResult
+    from app.models import IssueContract, StageResult
 
 
 # TDD 段落标识符
@@ -58,6 +58,35 @@ INLINE_PATTERNS = {
     "acceptance": (r"tdd[\s_-]*acceptance", r"acceptance(?:\s+criteria)?", r"dod"),
 }
 
+# Issue 合同（Contract）字段
+CONTRACT_FIELDS = ("goal", "scope", "dod", "risk", "rollback")
+
+CONTRACT_LABELS = {
+    "goal": "目标",
+    "scope": "范围",
+    "dod": "DoD",
+    "risk": "风险",
+    "rollback": "回滚",
+}
+
+CONTRACT_PATTERNS = {
+    "goal": [
+        r"^(背景与目标|目标|goal|objective|context)\b.*$",
+    ],
+    "scope": [
+        r"^(范围|scope|范围 / 非目标|范围/非目标|非目标|out of scope)\b.*$",
+    ],
+    "dod": [
+        r"^(验收标准|acceptance criteria|definition of done|dod)\b.*$",
+    ],
+    "risk": [
+        r"^(风险|risk)\b.*$",
+    ],
+    "rollback": [
+        r"^(回滚|rollback|roll back|fallback)\b.*$",
+    ],
+}
+
 
 def parse_tdd_sections(description: str) -> dict[str, str]:
     """从描述文本中解析 TDD 段落。
@@ -91,6 +120,114 @@ def parse_tdd_sections(description: str) -> dict[str, str]:
         sections[key] = "\n".join(x for x in lines if x.strip()).strip()
 
     return sections
+
+
+def parse_issue_contract(description: str) -> "IssueContract":
+    """从 issue 描述中解析合同字段并评分。
+
+    合同字段包含：目标/范围/DoD/风险/回滚。
+    """
+    from app.models import IssueContract
+
+    contract_data = {field: "" for field in CONTRACT_FIELDS}
+    if not description.strip():
+        return _build_issue_contract(contract_data)
+
+    buffers = {field: [] for field in CONTRACT_FIELDS}
+    current: str | None = None
+
+    for raw_line in description.splitlines():
+        line = raw_line.strip()
+        marker = detect_contract_section_marker(line)
+        if marker:
+            current = marker
+            inline_content = extract_inline_contract_section_content(line, marker)
+            if inline_content:
+                buffers[current].append(inline_content)
+            continue
+
+        if detect_tdd_section_marker(line):
+            current = None
+            continue
+
+        if line.startswith("#") and detect_contract_section_marker(line) is None:
+            current = None
+
+        if current:
+            buffers[current].append(raw_line.rstrip())
+
+    for key, lines in buffers.items():
+        contract_data[key] = "\n".join(x for x in lines if x.strip()).strip()
+
+    return _build_issue_contract(contract_data)
+
+
+def detect_contract_section_marker(line: str) -> str | None:
+    """检测一行是否为合同段落标题。"""
+    if not line:
+        return None
+
+    cleaned = line.lower()
+    cleaned = re.sub(r"^[\s#>*`\-0-9\.\)\(]+", "", cleaned)
+    cleaned = cleaned.replace("*", "").replace("`", "").strip()
+    if not cleaned:
+        return None
+
+    for field, patterns in CONTRACT_PATTERNS.items():
+        for pattern in patterns:
+            if re.match(pattern, cleaned):
+                return field
+    return None
+
+
+def extract_inline_contract_section_content(line: str, marker: str) -> str:
+    """提取合同段落标题后同一行的内容。"""
+    label_patterns = {
+        "goal": r"(?:背景与目标|目标|goal|objective|context)",
+        "scope": r"(?:范围|scope|非目标|out of scope)",
+        "dod": r"(?:验收标准|acceptance criteria|definition of done|dod)",
+        "risk": r"(?:风险|risk)",
+        "rollback": r"(?:回滚|rollback|roll back|fallback)",
+    }
+    token = label_patterns.get(marker)
+    if not token:
+        return ""
+    matched = re.match(
+        rf"(?i)^[\s#>*`\-0-9\.\)\(]*(?:{token})\s*[:：]\s*(.+)$",
+        line.strip(),
+    )
+    if not matched:
+        return ""
+    return matched.group(1).strip()
+
+
+def issue_contract_missing_fields(contract: "IssueContract") -> list[str]:
+    """返回缺失的合同字段列表。"""
+    return [field for field in CONTRACT_FIELDS if not str(getattr(contract, field, "")).strip()]
+
+
+def issue_contract_score(contract: "IssueContract") -> int:
+    """计算合同完整度分数（0-100）。"""
+    required = len(CONTRACT_FIELDS)
+    if required <= 0:
+        return 100
+    filled = required - len(issue_contract_missing_fields(contract))
+    return int((filled / required) * 100)
+
+
+def _build_issue_contract(contract_data: dict[str, str]) -> "IssueContract":
+    from app.models import IssueContract
+
+    contract = IssueContract(
+        goal=str(contract_data.get("goal", "")).strip(),
+        scope=str(contract_data.get("scope", "")).strip(),
+        dod=str(contract_data.get("dod", "")).strip(),
+        risk=str(contract_data.get("risk", "")).strip(),
+        rollback=str(contract_data.get("rollback", "")).strip(),
+    )
+    contract.missing_fields = issue_contract_missing_fields(contract)
+    contract.score = issue_contract_score(contract)
+    return contract
 
 
 def detect_tdd_section_marker(line: str) -> str | None:
