@@ -241,3 +241,13 @@
   - 完成内容: 已完成本轮拆分任务闭环：`orchestrator` 模块拆分、薄封装委托、`tests/test_orchestrator.py` 拆分、全量回归通过、行数门禁统计与交付说明。
   - 证据: `uv run pytest -q -> 92 passed`；`MAX 797 src/app/orchestrator.py`。
   - 下一步: 无（本轮开发任务均已完成）。
+- 时间: 2026-03-04 19:16:05 CST
+  - 里程碑: MULTIAGENT-11 联调验证
+  - 完成内容: 按联调计划触发 `work_item.created`（签名 webhook），成功跑通 `Design -> Coding -> Review -> Done`；本地 trace 完整、`issue_runs` 终态为 `Done`，并已在 Plane 回写编排评论。
+  - 证据: issue `d58fc3ad-7115-416a-93a8-170d22e42d35`；`/internal/issues/{id}/trace` 显示 7 条关键轨迹；`issue_runs.state=Done`；Plane comments `count=3` 且包含 `[编排器]/[ORCH]`。
+  - 下一步: 无（本次联调目标已完成）。
+- 时间: 2026-03-04 19:27:13 CST
+  - 里程碑: README 文档补全
+  - 完成内容: 按当前项目状态重写 `README.md`，补充架构拆分（`app/orch/*`）、环境配置、启动步骤、API、治理阈值、联调与排障说明。
+  - 证据: `README.md` 更新完成。
+  - 下一步: 执行最小校验并提交推送到 GitHub。
