@@ -209,3 +209,51 @@ async def test_retry_issue_serializes_same_issue(make_config, tmp_path: Path):
     await asyncio.gather(orch.retry_issue("1006"), orch.retry_issue("1006"))
 
     assert agent.max_running == 1
+
+
+@pytest.mark.asyncio
+async def test_handle_webhook_limits_global_issue_concurrency(make_config, tmp_path: Path):
+    class SlowAgent:
+        def __init__(self) -> None:
+            self.running = 0
+            self.max_running = 0
+
+        async def run_stage(self, stage: Stage, context):
+            self.running += 1
+            self.max_running = max(self.max_running, self.running)
+            await asyncio.sleep(0.05)
+            self.running -= 1
+            return StageResult(status=StageStatus.SUCCESS, summary=f"{stage.value} ok")
+
+    config = make_config(project_id="p1", issue_max_concurrency=2)
+    store = SQLiteStore(str(tmp_path / "db7.sqlite"))
+    agent = SlowAgent()
+    orch = Orchestrator(
+        app_config=config,
+        store=store,
+        plane_client=FakePlaneClient(),
+        github_client=FakeGitHubClient(),
+        agent_adapter=agent,
+        quality_gate=QualityGate(),
+    )
+
+    async def send_event(idx: int) -> dict[str, str]:
+        payload = {
+            "event": "work_item.created",
+            "event_id": f"evt-limit-{idx}",
+            "data": {
+                "work_item": {
+                    "id": f"limit-{idx}",
+                    "project_id": "p1",
+                    "name": f"limit-{idx}",
+                    "state_name": "Todo",
+                    "updated_at": f"2026-03-03T00:00:{idx:02d}Z",
+                }
+            },
+        }
+        return await orch.handle_webhook(payload)
+
+    results = await asyncio.gather(*(send_event(i) for i in range(1, 6)))
+
+    assert all(item["status"] == "accepted" for item in results)
+    assert agent.max_running == 2

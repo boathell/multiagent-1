@@ -21,6 +21,7 @@
 ```text
 src/app/
   orchestrator.py              # 主流程（薄封装 + 委托）
+  workspace_manager.py         # issue 级 git worktree 工作区管理
   orch/
     events.py                  # event/issue 提取、description 归一化、入口判定
     review_context.py          # git diff 收集与分片
@@ -70,6 +71,11 @@ cp .env.example .env
 - `REVIEW_MAX_LOOPS`
 - `REVIEW_ARBITER_MAX_LOOPS`
 - `MAX_CODE_FILE_LINES`
+- `ISSUE_MAX_CONCURRENCY`
+- `ISSUE_WORKTREE_ENABLED`
+- `ISSUE_WORKTREE_ROOT`
+- `ISSUE_WORKTREE_CLEANUP_ENABLED`
+- `ISSUE_WORKTREE_RETENTION_HOURS`
 
 > 提示：本项目对本地 Plane 常用 `http://localhost:8080`。若遇到 SSL/代理干扰，优先检查全局环境变量是否覆盖 `.env`。
 
@@ -131,6 +137,57 @@ curl -sS http://127.0.0.1:8787/healthz
 - `MAX_CODE_FILE_LINES`：单文件代码行数上限
 - `HUMAN_HANDOFF_ENABLED`：是否启用人类接管
 - `TDD_ENFORCEMENT_MODE`：`strict | advisory`
+- `ISSUE_MAX_CONCURRENCY`：全局 issue 并发上限（默认 `2`）
+- `ISSUE_WORKTREE_ENABLED`：是否启用 issue 独立 worktree（默认 `true`）
+- `ISSUE_WORKTREE_ROOT`：issue worktree 根目录（默认 `.data/worktrees`）
+- `ISSUE_WORKTREE_CLEANUP_ENABLED`：是否在 issue 终态后自动清理陈旧 worktree（默认 `false`）
+- `ISSUE_WORKTREE_RETENTION_HOURS`：陈旧 worktree 保留时长（小时，默认 `72`）
+
+### 8.1 关键配置项说明（重点）
+
+- `REVIEW_MAX_LOOPS`
+  - **用途**：限制同一 issue 在 Review 阶段被打回（`NEEDS_CHANGES`）后，自动回到 Coding 的最大次数。
+  - **触发点**：每次 Review 返回 `NEEDS_CHANGES`，计数 +1；超过阈值后不再直接回 Coding，而是进入“设计仲裁”决策。
+  - **建议**：日常可用 `1~2`。值越大，自动迭代更久，但也可能增加无效循环时间。
+
+- `REVIEW_ARBITER_MAX_LOOPS`
+  - **用途**：限制“Review 超限后触发 Design 仲裁”的最大次数。
+  - **触发点**：当 `REVIEW_MAX_LOOPS` 已超限时，才会消耗该计数。
+  - **行为**：超过该值后，流程直接进入 `Blocked`，避免无限仲裁循环。
+  - **建议**：通常与 `REVIEW_MAX_LOOPS` 保持一致或更小（例如都为 `1` 或 `2`）。
+
+- `MAX_CODE_FILE_LINES`
+  - **用途**：限制单个代码文件最大行数（质量门禁）。
+  - **触发点**：Coding 成功后执行质量门禁时检查；任一文件超限即阻断并进入失败路径。
+  - **建议**：默认 `1000`；如果团队偏向小文件治理，可下调到 `600~800`。
+
+- `HUMAN_HANDOFF_ENABLED`
+  - **用途**：是否启用自动人类接管评论（`[HUMAN-HANDOFF]`）与阻断策略。
+  - **建议**：生产环境保持 `true`，便于异常场景快速止损。
+
+- `TDD_ENFORCEMENT_MODE`
+  - `strict`：协议缺项直接判失败并进入失败处理链路。
+  - `advisory`：协议缺项仅告警，流程可继续（适合迁移期/试运行）。
+
+### 8.2 两个 Review 阈值如何配合
+
+- 常见配置：
+  - `REVIEW_MAX_LOOPS=2`
+  - `REVIEW_ARBITER_MAX_LOOPS=2`
+- 语义：
+  1. Review 最多允许 2 次自动回流到 Coding。
+  2. 超过后最多允许 2 次“设计仲裁”做继续/停止决策。
+  3. 仲裁次数也超限时，直接 `Blocked` 并提示人工介入。
+
+> 简单理解：`REVIEW_MAX_LOOPS` 控制“回流次数”，`REVIEW_ARBITER_MAX_LOOPS` 控制“超限后还能仲裁几次”。
+
+### 8.3 并发与工作区隔离（新增）
+
+- 默认启用 issue 隔离工作区：每个 issue 使用独立 `git worktree` 执行 `Design/Coding/Review`。
+- 路径规则：`<ISSUE_WORKTREE_ROOT>/<project_id>/<issue_id>/`。
+- 全局并发受 `ISSUE_MAX_CONCURRENCY` 控制；超限后在内存中排队，不丢任务。
+- 若 worktree 初始化失败，issue 直接进入 `Blocked`（`failure_class=ENV_ISSUE`），并给出人工处理建议。
+- 若启用 `ISSUE_WORKTREE_CLEANUP_ENABLED`，在 issue 进入 `Done/Blocked` 后会机会式清理超过 `ISSUE_WORKTREE_RETENTION_HOURS` 且不活跃的 worktree。
 
 阈值优先级：
 

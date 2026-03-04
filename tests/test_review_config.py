@@ -121,3 +121,39 @@ def test_review_max_loops_use_default_when_env_and_yaml_missing(monkeypatch, tmp
 
     assert config.get_review_max_loops() == 1
     assert orchestrator.max_review_loops == 1
+
+
+def test_issue_workspace_defaults_when_env_missing(monkeypatch, tmp_path: Path):
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv("ISSUE_MAX_CONCURRENCY", raising=False)
+    monkeypatch.delenv("ISSUE_WORKTREE_ENABLED", raising=False)
+    monkeypatch.delenv("ISSUE_WORKTREE_ROOT", raising=False)
+    monkeypatch.delenv("ISSUE_WORKTREE_CLEANUP_ENABLED", raising=False)
+    monkeypatch.delenv("ISSUE_WORKTREE_RETENTION_HOURS", raising=False)
+    _write_config_files(tmp_path, "use_mock: true\n")
+
+    config = load_app_config(base_dir=tmp_path)
+
+    assert config.get_issue_max_concurrency() == 2
+    assert config.settings.issue_worktree_enabled is True
+    assert config.get_issue_worktree_root(base_dir=tmp_path) == tmp_path / ".data" / "worktrees"
+    assert config.settings.issue_worktree_cleanup_enabled is False
+    assert config.get_issue_worktree_retention_hours() == 72
+
+
+def test_issue_workspace_env_overrides(monkeypatch, tmp_path: Path):
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("ISSUE_MAX_CONCURRENCY", "5")
+    monkeypatch.setenv("ISSUE_WORKTREE_ENABLED", "false")
+    monkeypatch.setenv("ISSUE_WORKTREE_ROOT", "/tmp/custom-worktrees")
+    monkeypatch.setenv("ISSUE_WORKTREE_CLEANUP_ENABLED", "true")
+    monkeypatch.setenv("ISSUE_WORKTREE_RETENTION_HOURS", "8")
+    _write_config_files(tmp_path, "use_mock: true\n")
+
+    config = load_app_config(base_dir=tmp_path)
+
+    assert config.get_issue_max_concurrency() == 5
+    assert config.settings.issue_worktree_enabled is False
+    assert config.get_issue_worktree_root(base_dir=tmp_path) == Path("/tmp/custom-worktrees")
+    assert config.settings.issue_worktree_cleanup_enabled is True
+    assert config.get_issue_worktree_retention_hours() == 8

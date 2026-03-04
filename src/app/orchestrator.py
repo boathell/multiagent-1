@@ -27,6 +27,7 @@ from app.tdd_parser import (
     parse_tdd_sections,
     tdd_missing_sections,
 )
+from app.workspace_manager import WorkspaceError, WorkspaceManager
 
 
 class Orchestrator:
@@ -53,7 +54,14 @@ class Orchestrator:
         self.human_handoff_enabled = bool(self.config.settings.human_handoff_enabled)
         mode = str(self.config.settings.tdd_enforcement_mode or "strict").strip().lower()
         self.tdd_enforcement_mode = mode if mode in {"advisory", "strict"} else "strict"
+        self.issue_max_concurrency = self.config.get_issue_max_concurrency()
+        self.issue_worktree_enabled = bool(self.config.settings.issue_worktree_enabled)
+        self.issue_worktree_root = self.config.get_issue_worktree_root()
+        self.issue_worktree_cleanup_enabled = bool(self.config.settings.issue_worktree_cleanup_enabled)
+        self.issue_worktree_retention_hours = self.config.get_issue_worktree_retention_hours()
         self._issue_locks: dict[str, asyncio.Lock] = {}
+        self._issue_semaphore = asyncio.Semaphore(self.issue_max_concurrency)
+        self.workspace_manager = WorkspaceManager(worktree_root=self.issue_worktree_root)
 
     async def handle_webhook(self, payload: dict[str, Any]) -> dict[str, Any]:
         event_id = self.extract_event_id(payload)
@@ -81,13 +89,14 @@ class Orchestrator:
                 )
                 return {"status": "ignored", "reason": "event filtered", "event_id": event_id}
 
-            await self.process_issue(
-                issue_id=issue_id,
-                project_id=issue_data["project_id"],
-                title=issue_data["title"],
-                description=issue_data["description"],
-                force=False,
-            )
+            async with self._issue_semaphore:
+                await self.process_issue(
+                    issue_id=issue_id,
+                    project_id=issue_data["project_id"],
+                    title=issue_data["title"],
+                    description=issue_data["description"],
+                    force=False,
+                )
 
         return {"status": "accepted", "event_id": event_id, "issue_id": issue_id}
 
@@ -113,13 +122,14 @@ class Orchestrator:
                     state = PipelineState.CODING
                 self.store.update_issue_fields(issue_id, state=state.value)
 
-            await self.process_issue(
-                issue_id=issue_id,
-                project_id=issue["project_id"],
-                title=issue["title"],
-                description=str(issue.get("description", "")),
-                force=True,
-            )
+            async with self._issue_semaphore:
+                await self.process_issue(
+                    issue_id=issue_id,
+                    project_id=issue["project_id"],
+                    title=issue["title"],
+                    description=str(issue.get("description", "")),
+                    force=True,
+                )
         return {"status": "replayed", "issue_id": issue_id}
 
     def get_trace(self, issue_id: str) -> list[dict[str, Any]]:
@@ -256,12 +266,36 @@ class Orchestrator:
             )
             return
 
+        try:
+            workspace_path = self._resolve_issue_workspace(
+                issue_id=issue_id,
+                project_id=project_id,
+                project_local_path=project.local_path,
+                base_branch=project.base_branch,
+            )
+        except WorkspaceError as exc:
+            await self._handle_workspace_prepare_failure(
+                issue_id=issue_id,
+                project_id=project_id,
+                project=project,
+                error=str(exc),
+            )
+            return
+        self.store.update_issue_fields(issue_id, workspace_path=workspace_path)
+
         while True:
             stage = stage_for_state(current_state)
             if stage is None:
                 break
 
-            result = await self._run_stage_with_retry(stage, issue_id, project_id, title, project)
+            result = await self._run_stage_with_retry(
+                stage,
+                issue_id,
+                project_id,
+                title,
+                project,
+                workspace_path,
+            )
             failure_class = self._classify_failure(stage, result)
             if failure_class:
                 result.artifacts.setdefault("failure_class", failure_class)
@@ -387,7 +421,7 @@ class Orchestrator:
                 )
                 await self._sync_review_feedback_to_pr(
                     pr_url=str((self.store.get_issue(issue_id) or {}).get("pr_url", "")),
-                    local_path=project.local_path,
+                    local_path=workspace_path,
                     comment=fix_comment,
                 )
 
@@ -397,7 +431,7 @@ class Orchestrator:
                     self.store.update_issue_fields(issue_id, pr_url=pr_url)
                     await self._sync_tdd_summary_to_pr(
                         issue_id=issue_id,
-                        local_path=project.local_path,
+                        local_path=workspace_path,
                         pr_url=str(pr_url),
                         coding_result=result,
                     )
@@ -430,6 +464,7 @@ class Orchestrator:
                 )
 
             if current_state in {PipelineState.DONE, PipelineState.BLOCKED}:
+                await self._cleanup_stale_issue_worktrees(project=project)
                 break
 
     async def _run_stage_with_retry(
@@ -439,6 +474,7 @@ class Orchestrator:
         project_id: str,
         title: str,
         project,
+        workspace_path: str,
     ) -> StageResult:
         total_attempts = self.max_retries + 1
         last_result = StageResult(status=StageStatus.FAILED, summary="No execution")
@@ -456,7 +492,7 @@ class Orchestrator:
                 title=title,
                 description=str(issue.get("description", "")),
                 repo_url=project.repo_url,
-                local_path=project.local_path,
+                local_path=workspace_path,
                 base_branch=project.base_branch,
                 branch=issue.get("branch", ""),
                 pr_url=issue.get("pr_url", ""),
@@ -471,7 +507,7 @@ class Orchestrator:
             if stage == Stage.REVIEW:
                 context.metadata.update(
                     self._collect_review_context(
-                        local_path=project.local_path,
+                        local_path=workspace_path,
                         base_branch=project.base_branch,
                         branch=context.branch,
                     )
@@ -495,7 +531,7 @@ class Orchestrator:
             if stage == Stage.CODING and result.status == StageStatus.SUCCESS:
                 gate_result = await self.quality_gate.run(
                     project.checks,
-                    project.local_path,
+                    workspace_path,
                     max_code_file_lines=self.max_code_file_lines,
                 )
                 if not gate_result.ok:
@@ -527,7 +563,7 @@ class Orchestrator:
                     issue_id=issue_id,
                     title=title,
                     body="Generated by multi-agent orchestrator",
-                    local_path=project.local_path,
+                    local_path=workspace_path,
                     base_branch=project.base_branch,
                     repo_url=project.repo_url,
                 )
@@ -688,6 +724,100 @@ class Orchestrator:
             local_path=local_path,
             comment=comment,
         )
+
+    def _resolve_issue_workspace(
+        self,
+        *,
+        issue_id: str,
+        project_id: str,
+        project_local_path: str,
+        base_branch: str,
+    ) -> str:
+        if not self.issue_worktree_enabled:
+            return project_local_path
+        return self.workspace_manager.prepare_workspace(
+            project_local_path=project_local_path,
+            project_id=project_id,
+            issue_id=issue_id,
+            base_branch=base_branch,
+        )
+
+    async def _handle_workspace_prepare_failure(
+        self,
+        *,
+        issue_id: str,
+        project_id: str,
+        project,
+        error: str,
+    ) -> None:
+        failure_class = FailureClass.ENV_ISSUE.value
+        message = f"Issue workspace prepare failed: {error}"
+        self.store.append_trace(
+            issue_id=issue_id,
+            stage="workspace",
+            status="failed",
+            message=message,
+            metadata={
+                "failure_class": failure_class,
+                "workspace_root": str(self.issue_worktree_root),
+            },
+        )
+        self.store.update_issue_fields(
+            issue_id,
+            state=PipelineState.BLOCKED.value,
+            failure_class=failure_class,
+            handoff_reason="workspace_prepare_failed",
+        )
+
+        handoff_comment = build_handoff_comment(
+            issue_id=issue_id,
+            stage=Stage.CODING,
+            failure_class=failure_class,
+            reason=f"Issue 独立工作区初始化失败：{error}",
+            attempted=["准备 issue 专属 git worktree"],
+            suggested_actions=[
+                "请确认仓库目录可写且是有效 git 仓库",
+                "检查 git worktree 功能是否可用后重试",
+            ],
+        )
+        await self.plane_client.add_comment(
+            project_id=project_id,
+            issue_id=issue_id,
+            comment=handoff_comment,
+        )
+        await self._set_state(
+            issue_id=issue_id,
+            project_id=project_id,
+            state=PipelineState.BLOCKED,
+            message=message,
+            state_map=project.state_map,
+        )
+
+    async def _cleanup_stale_issue_worktrees(self, *, project) -> None:
+        if not self.issue_worktree_enabled or not self.issue_worktree_cleanup_enabled:
+            return
+
+        try:
+            active_paths = self.store.list_active_workspace_paths()
+            summary = self.workspace_manager.cleanup_stale_worktrees(
+                project_local_path=project.local_path,
+                active_workspace_paths=active_paths,
+                retention_hours=self.issue_worktree_retention_hours,
+            )
+        except WorkspaceError as exc:
+            self.logger.warning("Issue worktree cleanup skipped: %s", exc)
+            return
+
+        removed = int(summary.get("removed", 0))
+        errors = summary.get("errors", [])
+        if removed > 0:
+            self.logger.info(
+                "Issue worktree cleanup removed=%s retention_hours=%s",
+                removed,
+                self.issue_worktree_retention_hours,
+            )
+        if isinstance(errors, list) and errors:
+            self.logger.warning("Issue worktree cleanup errors: %s", " | ".join(str(x) for x in errors[:5]))
 
     @staticmethod
     def _extract_named_section(text: str, token: str) -> str:

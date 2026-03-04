@@ -42,6 +42,11 @@ class Settings(BaseSettings):
     feishu_signing_secret: str = Field(default="", alias="FEISHU_SIGNING_SECRET")
 
     agents_use_mock: bool = Field(default=True, alias="AGENTS_USE_MOCK")
+    issue_max_concurrency: int = Field(default=2, alias="ISSUE_MAX_CONCURRENCY")
+    issue_worktree_enabled: bool = Field(default=True, alias="ISSUE_WORKTREE_ENABLED")
+    issue_worktree_root: str = Field(default=".data/worktrees", alias="ISSUE_WORKTREE_ROOT")
+    issue_worktree_cleanup_enabled: bool = Field(default=False, alias="ISSUE_WORKTREE_CLEANUP_ENABLED")
+    issue_worktree_retention_hours: int = Field(default=72, alias="ISSUE_WORKTREE_RETENTION_HOURS")
 
 
 @dataclass
@@ -67,6 +72,20 @@ class AppConfig:
             yaml_key="arbiter_max_loops",
             default=DEFAULT_REVIEW_ARBITER_MAX_LOOPS,
         )
+
+    def get_issue_max_concurrency(self) -> int:
+        return max(1, int(self.settings.issue_max_concurrency))
+
+    def get_issue_worktree_root(self, base_dir: Path | None = None) -> Path:
+        root = base_dir or Path.cwd()
+        raw = str(self.settings.issue_worktree_root or ".data/worktrees").strip()
+        path = Path(raw)
+        if path.is_absolute():
+            return path
+        return root / path
+
+    def get_issue_worktree_retention_hours(self) -> int:
+        return max(0, int(self.settings.issue_worktree_retention_hours))
 
     def _resolve_review_value(self, settings_value: int | None, yaml_key: str, default: int) -> int:
         if settings_value is not None:

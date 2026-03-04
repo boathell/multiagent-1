@@ -42,6 +42,7 @@ class SQLiteStore:
                     project_id TEXT NOT NULL,
                     title TEXT NOT NULL DEFAULT '',
                     description TEXT NOT NULL DEFAULT '',
+                    workspace_path TEXT NOT NULL DEFAULT '',
                     state TEXT NOT NULL,
                     branch TEXT NOT NULL DEFAULT '',
                     pr_url TEXT NOT NULL DEFAULT '',
@@ -76,6 +77,8 @@ class SQLiteStore:
         }
         if "description" not in cols:
             conn.execute("ALTER TABLE issue_runs ADD COLUMN description TEXT NOT NULL DEFAULT ''")
+        if "workspace_path" not in cols:
+            conn.execute("ALTER TABLE issue_runs ADD COLUMN workspace_path TEXT NOT NULL DEFAULT ''")
         if "arbiter_loops" not in cols:
             conn.execute("ALTER TABLE issue_runs ADD COLUMN arbiter_loops INTEGER NOT NULL DEFAULT 0")
         if "failure_class" not in cols:
@@ -148,6 +151,7 @@ class SQLiteStore:
             "branch",
             "pr_url",
             "description",
+            "workspace_path",
             "attempts",
             "review_loops",
             "arbiter_loops",
@@ -236,3 +240,15 @@ class SQLiteStore:
             record.pop("metadata_json", None)
             traces.append(record)
         return traces
+
+    def list_active_workspace_paths(self) -> set[str]:
+        with self._conn() as conn:
+            rows = conn.execute(
+                """
+                SELECT workspace_path
+                FROM issue_runs
+                WHERE workspace_path != ''
+                  AND lower(state) NOT IN ('done', 'blocked')
+                """
+            ).fetchall()
+        return {str(row["workspace_path"]).strip() for row in rows if str(row["workspace_path"]).strip()}
