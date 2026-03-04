@@ -132,6 +132,44 @@ curl -sS http://127.0.0.1:8787/healthz
 - `HUMAN_HANDOFF_ENABLED`：是否启用人类接管
 - `TDD_ENFORCEMENT_MODE`：`strict | advisory`
 
+### 8.1 关键配置项说明（重点）
+
+- `REVIEW_MAX_LOOPS`
+  - **用途**：限制同一 issue 在 Review 阶段被打回（`NEEDS_CHANGES`）后，自动回到 Coding 的最大次数。
+  - **触发点**：每次 Review 返回 `NEEDS_CHANGES`，计数 +1；超过阈值后不再直接回 Coding，而是进入“设计仲裁”决策。
+  - **建议**：日常可用 `1~2`。值越大，自动迭代更久，但也可能增加无效循环时间。
+
+- `REVIEW_ARBITER_MAX_LOOPS`
+  - **用途**：限制“Review 超限后触发 Design 仲裁”的最大次数。
+  - **触发点**：当 `REVIEW_MAX_LOOPS` 已超限时，才会消耗该计数。
+  - **行为**：超过该值后，流程直接进入 `Blocked`，避免无限仲裁循环。
+  - **建议**：通常与 `REVIEW_MAX_LOOPS` 保持一致或更小（例如都为 `1` 或 `2`）。
+
+- `MAX_CODE_FILE_LINES`
+  - **用途**：限制单个代码文件最大行数（质量门禁）。
+  - **触发点**：Coding 成功后执行质量门禁时检查；任一文件超限即阻断并进入失败路径。
+  - **建议**：默认 `1000`；如果团队偏向小文件治理，可下调到 `600~800`。
+
+- `HUMAN_HANDOFF_ENABLED`
+  - **用途**：是否启用自动人类接管评论（`[HUMAN-HANDOFF]`）与阻断策略。
+  - **建议**：生产环境保持 `true`，便于异常场景快速止损。
+
+- `TDD_ENFORCEMENT_MODE`
+  - `strict`：协议缺项直接判失败并进入失败处理链路。
+  - `advisory`：协议缺项仅告警，流程可继续（适合迁移期/试运行）。
+
+### 8.2 两个 Review 阈值如何配合
+
+- 常见配置：
+  - `REVIEW_MAX_LOOPS=2`
+  - `REVIEW_ARBITER_MAX_LOOPS=2`
+- 语义：
+  1. Review 最多允许 2 次自动回流到 Coding。
+  2. 超过后最多允许 2 次“设计仲裁”做继续/停止决策。
+  3. 仲裁次数也超限时，直接 `Blocked` 并提示人工介入。
+
+> 简单理解：`REVIEW_MAX_LOOPS` 控制“回流次数”，`REVIEW_ARBITER_MAX_LOOPS` 控制“超限后还能仲裁几次”。
+
 阈值优先级：
 
 1. 环境变量
