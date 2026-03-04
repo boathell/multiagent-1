@@ -21,6 +21,7 @@
 ```text
 src/app/
   orchestrator.py              # 主流程（薄封装 + 委托）
+  workspace_manager.py         # issue 级 git worktree 工作区管理
   orch/
     events.py                  # event/issue 提取、description 归一化、入口判定
     review_context.py          # git diff 收集与分片
@@ -70,6 +71,11 @@ cp .env.example .env
 - `REVIEW_MAX_LOOPS`
 - `REVIEW_ARBITER_MAX_LOOPS`
 - `MAX_CODE_FILE_LINES`
+- `ISSUE_MAX_CONCURRENCY`
+- `ISSUE_WORKTREE_ENABLED`
+- `ISSUE_WORKTREE_ROOT`
+- `ISSUE_WORKTREE_CLEANUP_ENABLED`
+- `ISSUE_WORKTREE_RETENTION_HOURS`
 
 > 提示：本项目对本地 Plane 常用 `http://localhost:8080`。若遇到 SSL/代理干扰，优先检查全局环境变量是否覆盖 `.env`。
 
@@ -131,6 +137,11 @@ curl -sS http://127.0.0.1:8787/healthz
 - `MAX_CODE_FILE_LINES`：单文件代码行数上限
 - `HUMAN_HANDOFF_ENABLED`：是否启用人类接管
 - `TDD_ENFORCEMENT_MODE`：`strict | advisory`
+- `ISSUE_MAX_CONCURRENCY`：全局 issue 并发上限（默认 `2`）
+- `ISSUE_WORKTREE_ENABLED`：是否启用 issue 独立 worktree（默认 `true`）
+- `ISSUE_WORKTREE_ROOT`：issue worktree 根目录（默认 `.data/worktrees`）
+- `ISSUE_WORKTREE_CLEANUP_ENABLED`：是否在 issue 终态后自动清理陈旧 worktree（默认 `false`）
+- `ISSUE_WORKTREE_RETENTION_HOURS`：陈旧 worktree 保留时长（小时，默认 `72`）
 
 ### 8.1 关键配置项说明（重点）
 
@@ -169,6 +180,14 @@ curl -sS http://127.0.0.1:8787/healthz
   3. 仲裁次数也超限时，直接 `Blocked` 并提示人工介入。
 
 > 简单理解：`REVIEW_MAX_LOOPS` 控制“回流次数”，`REVIEW_ARBITER_MAX_LOOPS` 控制“超限后还能仲裁几次”。
+
+### 8.3 并发与工作区隔离（新增）
+
+- 默认启用 issue 隔离工作区：每个 issue 使用独立 `git worktree` 执行 `Design/Coding/Review`。
+- 路径规则：`<ISSUE_WORKTREE_ROOT>/<project_id>/<issue_id>/`。
+- 全局并发受 `ISSUE_MAX_CONCURRENCY` 控制；超限后在内存中排队，不丢任务。
+- 若 worktree 初始化失败，issue 直接进入 `Blocked`（`failure_class=ENV_ISSUE`），并给出人工处理建议。
+- 若启用 `ISSUE_WORKTREE_CLEANUP_ENABLED`，在 issue 进入 `Done/Blocked` 后会机会式清理超过 `ISSUE_WORKTREE_RETENTION_HOURS` 且不活跃的 worktree。
 
 阈值优先级：
 

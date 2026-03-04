@@ -38,6 +38,7 @@ def test_store_migrates_issue_runs_add_description_column(tmp_path: Path):
     cols = {row[1] for row in conn.execute("PRAGMA table_info(issue_runs)").fetchall()}
     conn.close()
     assert "description" in cols
+    assert "workspace_path" in cols
     assert "arbiter_loops" in cols
     assert "failure_class" in cols
     assert "handoff_reason" in cols
@@ -66,3 +67,19 @@ def test_store_update_issue_failure_fields(tmp_path: Path):
     assert issue is not None
     assert issue["failure_class"] == "PROTOCOL_VIOLATION"
     assert issue["handoff_reason"] == "protocol_violation_consecutive"
+
+
+def test_store_list_active_workspace_paths(tmp_path: Path):
+    store = SQLiteStore(str(tmp_path / "store3.sqlite"))
+    store.upsert_issue("a-1", "p-1", "active", "Coding", description="")
+    store.update_issue_fields("a-1", workspace_path="/tmp/wt-a")
+    store.upsert_issue("a-2", "p-1", "done", "Done", description="")
+    store.update_issue_fields("a-2", workspace_path="/tmp/wt-b")
+    store.upsert_issue("a-3", "p-1", "blocked", "Blocked", description="")
+    store.update_issue_fields("a-3", workspace_path="/tmp/wt-c")
+
+    active = store.list_active_workspace_paths()
+
+    assert "/tmp/wt-a" in active
+    assert "/tmp/wt-b" not in active
+    assert "/tmp/wt-c" not in active

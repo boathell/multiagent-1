@@ -70,6 +70,7 @@ async def test_review_stage_collects_git_diff_context(make_config, tmp_path: Pat
         project_id="p1",
         title="review ctx",
         project=config.projects["p1"],
+        workspace_path=str(repo),
     )
     assert result.status == StageStatus.SUCCESS
     assert agent.captured is not None
