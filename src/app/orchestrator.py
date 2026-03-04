@@ -1,17 +1,32 @@
 from __future__ import annotations
 
 import asyncio
-import html
 import logging
-import re
-import subprocess
 from typing import Any
 
+from app.comment_utils import (
+    build_contract_reminder_comment,
+    build_handoff_comment,
+    collect_attempted_actions,
+)
 from app.config import AppConfig
-from app.models import IssueContext, PipelineState, Stage, StageResult, StageStatus
+from app.models import FailureClass, IssueContext, PipelineState, Stage, StageResult, StageStatus
+from app.orch import comments as orch_comments
+from app.orch import events as orch_events
+from app.orch import governance as orch_governance
+from app.orch import pr_sync as orch_pr_sync
+from app.orch import review_context as orch_review_context
 from app.quality_gate import QualityGate
+from app.review_arbiter import build_arbiter_comment, resolve_review_overflow_with_design
 from app.state_machine import next_state, stage_for_state, to_state
 from app.store import SQLiteStore
+from app.tdd_parser import (
+    extract_tdd_sections_from_stage_result,
+    parse_issue_contract,
+    merge_tdd_sections,
+    parse_tdd_sections,
+    tdd_missing_sections,
+)
 
 
 class Orchestrator:
@@ -32,7 +47,12 @@ class Orchestrator:
         self.quality_gate = quality_gate
         self.logger = logging.getLogger("app.orchestrator")
         self.max_retries = 1
-        self.max_review_loops = 1
+        self.max_review_loops = self.config.get_review_max_loops()
+        self.max_review_arbiter_loops = self.config.get_review_arbiter_max_loops()
+        self.max_code_file_lines = max(0, int(self.config.settings.max_code_file_lines))
+        self.human_handoff_enabled = bool(self.config.settings.human_handoff_enabled)
+        mode = str(self.config.settings.tdd_enforcement_mode or "strict").strip().lower()
+        self.tdd_enforcement_mode = mode if mode in {"advisory", "strict"} else "strict"
         self._issue_locks: dict[str, asyncio.Lock] = {}
 
     async def handle_webhook(self, payload: dict[str, Any]) -> dict[str, Any]:
@@ -145,6 +165,77 @@ class Orchestrator:
             self.store.update_issue_fields(issue_id, description=description)
             existing = self.store.get_issue(issue_id) or existing
 
+        contract = parse_issue_contract(str(existing.get("description", "")))
+        existing_failure_class = str(existing.get("failure_class", "")).strip()
+        if not existing_failure_class:
+            self.store.update_issue_fields(issue_id, failure_class="")
+        if contract.missing_fields and not self._has_contract_reminder(issue_id):
+            contract_comment = build_contract_reminder_comment(
+                score=contract.score,
+                missing_fields=contract.missing_fields,
+            )
+            self.store.append_trace(
+                issue_id,
+                stage="contract",
+                status="advisory",
+                message="Issue contract missing fields.",
+                metadata={"score": contract.score, "missing_fields": contract.missing_fields},
+            )
+            await self.plane_client.add_comment(
+                project_id=project_id,
+                issue_id=issue_id,
+                comment=contract_comment,
+            )
+
+        risk_keywords = self._detect_high_risk_keywords(str(existing.get("description", "")))
+        if risk_keywords and self.human_handoff_enabled:
+            handoff_result = StageResult(
+                status=StageStatus.FAILED,
+                summary="High-risk keywords require human handoff.",
+                artifacts={
+                    "failure_class": FailureClass.QUALITY_ISSUE.value,
+                    "handoff_reason": "high_risk_keywords",
+                    "risk_keywords": risk_keywords,
+                },
+            )
+            self.store.append_trace(
+                issue_id=issue_id,
+                stage="design",
+                status="failed",
+                message=handoff_result.summary,
+                metadata=handoff_result.artifacts,
+            )
+            handoff_comment = build_handoff_comment(
+                issue_id=issue_id,
+                stage=Stage.DESIGN,
+                failure_class=FailureClass.QUALITY_ISSUE.value,
+                reason=f"命中高风险关键词：{', '.join(risk_keywords)}",
+                attempted=["未启动自动执行"],
+                suggested_actions=[
+                    "请人工确认风险评估与回滚预案",
+                    "必要时拆分低风险子任务后再重试",
+                ],
+            )
+            await self.plane_client.add_comment(
+                project_id=project_id,
+                issue_id=issue_id,
+                comment=handoff_comment,
+            )
+            self.store.update_issue_fields(
+                issue_id,
+                state=PipelineState.BLOCKED.value,
+                failure_class=FailureClass.QUALITY_ISSUE.value,
+                handoff_reason="high_risk_keywords",
+            )
+            await self._set_state(
+                issue_id,
+                project_id,
+                PipelineState.BLOCKED,
+                "High-risk keywords require human handoff.",
+                project.state_map,
+            )
+            return
+
         current_state = to_state(existing["state"])
         if current_state == PipelineState.TODO:
             await self._set_state(
@@ -171,13 +262,17 @@ class Orchestrator:
                 break
 
             result = await self._run_stage_with_retry(stage, issue_id, project_id, title, project)
+            failure_class = self._classify_failure(stage, result)
+            if failure_class:
+                result.artifacts.setdefault("failure_class", failure_class)
+            result = self._apply_review_evidence_gate(stage, result)
             next_pipeline_state = next_state(current_state, result.status)
 
             if stage == Stage.DESIGN and result.status == StageStatus.SUCCESS:
                 issue_record = self.store.get_issue(issue_id) or {}
                 current_desc = str(issue_record.get("description", ""))
-                generated_sections = self._extract_tdd_sections_from_stage_result(result)
-                merged_desc, merged_sections, merged = self._merge_tdd_sections(
+                generated_sections = extract_tdd_sections_from_stage_result(result)
+                merged_desc, merged_sections, merged = merge_tdd_sections(
                     base_description=current_desc,
                     generated_sections=generated_sections,
                 )
@@ -192,7 +287,7 @@ class Orchestrator:
                         description=merged_desc,
                     )
 
-                missing_sections = self._tdd_missing_sections(merged_sections)
+                missing_sections = tdd_missing_sections(merged_sections)
                 if missing_sections and not self._has_tdd_reminder(issue_id):
                     labels = {"red": "Red", "green": "Green", "refactor": "Refactor"}
                     missing_names = ", ".join(labels.get(x, x) for x in missing_sections)
@@ -212,11 +307,63 @@ class Orchestrator:
                 loops = int((issue_record or {}).get("review_loops", 0)) + 1
                 self.store.update_issue_fields(issue_id, review_loops=loops)
                 if loops > self.max_review_loops:
+                    (
+                        result,
+                        next_pipeline_state,
+                        arbiter_trace,
+                    ) = await self._resolve_review_overflow_with_design(
+                        issue_id=issue_id,
+                        project_id=project_id,
+                        title=title,
+                        project=project,
+                        review_result=result,
+                        review_loops=loops,
+                    )
+                    if arbiter_trace is not None:
+                        self.store.append_trace(
+                            issue_id,
+                            stage="design_arbiter",
+                            status=arbiter_trace["status"],
+                            message=arbiter_trace["message"],
+                            metadata=arbiter_trace["metadata"],
+                        )
+                        await self.plane_client.add_comment(
+                            project_id=project_id,
+                            issue_id=issue_id,
+                            comment=self._build_arbiter_comment(arbiter_trace),
+                        )
+                    failure_class = self._classify_failure(stage, result)
+                    if failure_class:
+                        result.artifacts["failure_class"] = failure_class
+
+            handoff_reason = ""
+            handoff_comment = ""
+            handoff_meta = self._evaluate_handoff_trigger(
+                issue_id=issue_id,
+                stage=stage,
+                result=result,
+            )
+            if handoff_meta is not None and self.human_handoff_enabled:
+                handoff_reason = str(handoff_meta["handoff_reason"])
+                failure_class = str(handoff_meta["failure_class"])
+                result.artifacts["failure_class"] = failure_class
+                result.artifacts["handoff_reason"] = handoff_reason
+                result.artifacts["handoff_trigger"] = str(handoff_meta["trigger"])
+                if result.status == StageStatus.NEEDS_CHANGES:
                     result = StageResult(
                         status=StageStatus.FAILED,
-                        summary="Review loop exceeded max limit.",
+                        summary=f"Human handoff required: {handoff_reason}",
+                        artifacts={**result.artifacts},
                     )
-                    next_pipeline_state = PipelineState.BLOCKED
+                next_pipeline_state = PipelineState.BLOCKED
+                handoff_comment = build_handoff_comment(
+                    issue_id=issue_id,
+                    stage=stage,
+                    failure_class=failure_class,
+                    reason=handoff_reason,
+                    attempted=collect_attempted_actions(result.artifacts),
+                    suggested_actions=handoff_meta["suggested_actions"],
+                )
 
             self.store.append_trace(
                 issue_id,
@@ -225,14 +372,35 @@ class Orchestrator:
                 message=result.summary,
                 metadata=result.artifacts,
             )
+            if failure_class:
+                self.store.update_issue_fields(issue_id, failure_class=failure_class)
 
             comment = self._build_stage_comment(stage, result)
             await self.plane_client.add_comment(project_id=project_id, issue_id=issue_id, comment=comment)
+
+            if stage == Stage.REVIEW and result.status in {StageStatus.NEEDS_CHANGES, StageStatus.FAILED}:
+                fix_comment = self._build_review_fix_comment(result)
+                await self.plane_client.add_comment(
+                    project_id=project_id,
+                    issue_id=issue_id,
+                    comment=fix_comment,
+                )
+                await self._sync_review_feedback_to_pr(
+                    pr_url=str((self.store.get_issue(issue_id) or {}).get("pr_url", "")),
+                    local_path=project.local_path,
+                    comment=fix_comment,
+                )
 
             if stage == Stage.CODING and result.status == StageStatus.SUCCESS:
                 pr_url = result.artifacts.get("pr_url", "")
                 if pr_url:
                     self.store.update_issue_fields(issue_id, pr_url=pr_url)
+                    await self._sync_tdd_summary_to_pr(
+                        issue_id=issue_id,
+                        local_path=project.local_path,
+                        pr_url=str(pr_url),
+                        coding_result=result,
+                    )
 
             await self._set_state(
                 issue_id,
@@ -244,6 +412,16 @@ class Orchestrator:
             current_state = next_pipeline_state
 
             if current_state == PipelineState.BLOCKED:
+                if handoff_comment:
+                    await self.plane_client.add_comment(
+                        project_id=project_id,
+                        issue_id=issue_id,
+                        comment=handoff_comment,
+                    )
+                    self.store.update_issue_fields(
+                        issue_id,
+                        handoff_reason=handoff_reason,
+                    )
                 blocked_comment = self._build_blocked_comment(stage, result)
                 await self.plane_client.add_comment(
                     project_id=project_id,
@@ -264,6 +442,9 @@ class Orchestrator:
     ) -> StageResult:
         total_attempts = self.max_retries + 1
         last_result = StageResult(status=StageStatus.FAILED, summary="No execution")
+        attempt_failure_classes: list[str] = []
+        protocol_violation_attempts = 0
+        tool_failure_attempts = 0
 
         for _ in range(total_attempts):
             attempt_number = self.store.increment_attempt(issue_id, stage.value)
@@ -281,7 +462,11 @@ class Orchestrator:
                 pr_url=issue.get("pr_url", ""),
                 attempts=issue.get("attempts", {}),
                 review_loops=int(issue.get("review_loops", 0)),
-                tdd_sections=self.parse_tdd_sections(str(issue.get("description", ""))),
+                arbiter_loops=int(issue.get("arbiter_loops", 0)),
+                failure_class=str(issue.get("failure_class", "")),
+                handoff_reason=str(issue.get("handoff_reason", "")),
+                tdd_sections=parse_tdd_sections(str(issue.get("description", ""))),
+                issue_contract=parse_issue_contract(str(issue.get("description", ""))),
             )
             if stage == Stage.REVIEW:
                 context.metadata.update(
@@ -294,6 +479,48 @@ class Orchestrator:
 
             self.store.update_issue_fields(issue_id, last_stage=stage.value)
             result = await self.agent_adapter.run_stage(stage, context)
+            result = self._validate_stage_protocol(stage, result)
+            if stage == Stage.REVIEW:
+                result.artifacts["review_changed_files"] = context.metadata.get("review_changed_files", [])
+                result.artifacts["review_diff_range"] = context.metadata.get("review_diff_range", "")
+                result.artifacts["review_diff_truncated"] = bool(context.metadata.get("review_diff_truncated"))
+                result.artifacts["review_context_error"] = str(
+                    context.metadata.get("review_context_error", "")
+                ).strip()
+                result.artifacts["review_diff_files_included"] = context.metadata.get(
+                    "review_diff_files_included",
+                    [],
+                )
+
+            if stage == Stage.CODING and result.status == StageStatus.SUCCESS:
+                gate_result = await self.quality_gate.run(
+                    project.checks,
+                    project.local_path,
+                    max_code_file_lines=self.max_code_file_lines,
+                )
+                if not gate_result.ok:
+                    artifacts: dict[str, Any] = {
+                        "checks": [
+                            {
+                                "command": x.command,
+                                "exit_code": x.exit_code,
+                            }
+                            for x in gate_result.results
+                        ],
+                    }
+                    if gate_result.line_limit_violations:
+                        artifacts["line_limit_violations"] = gate_result.line_limit_violations
+                        result = StageResult(
+                            status=StageStatus.FAILED,
+                            summary=f"Code file line limit exceeded ({self.max_code_file_lines}).",
+                            artifacts=artifacts,
+                        )
+                    else:
+                        result = StageResult(
+                            status=StageStatus.FAILED,
+                            summary="Quality gate failed after coding stage.",
+                            artifacts=artifacts,
+                        )
 
             if stage == Stage.CODING and result.status == StageStatus.SUCCESS:
                 pr = self.github_client.create_branch_commit_and_pr(
@@ -308,25 +535,21 @@ class Orchestrator:
                 result.artifacts["pr_url"] = pr.pr_url
                 self.store.update_issue_fields(issue_id, branch=pr.branch, pr_url=pr.pr_url)
 
-                gate_result = await self.quality_gate.run(project.checks, project.local_path)
-                if not gate_result.ok:
-                    result = StageResult(
-                        status=StageStatus.FAILED,
-                        summary="Quality gate failed after coding stage.",
-                        artifacts={
-                            "checks": [
-                                {
-                                    "command": x.command,
-                                    "exit_code": x.exit_code,
-                                }
-                                for x in gate_result.results
-                            ]
-                        },
-                    )
-
             if result.status != StageStatus.FAILED:
                 self.store.reset_attempt(issue_id, stage.value)
                 return result
+
+            failure_class = self._classify_failure(stage, result)
+            if failure_class:
+                result.artifacts.setdefault("failure_class", failure_class)
+                attempt_failure_classes.append(failure_class)
+            if failure_class in {FailureClass.GEMINI_ISSUE.value, FailureClass.ENV_ISSUE.value}:
+                tool_failure_attempts += 1
+            if failure_class == FailureClass.PROTOCOL_VIOLATION.value:
+                protocol_violation_attempts += 1
+            result.artifacts["attempt_failure_classes"] = attempt_failure_classes.copy()
+            result.artifacts["tool_failure_attempts"] = tool_failure_attempts
+            result.artifacts["protocol_violation_attempts"] = protocol_violation_attempts
 
             last_result = result
             self.store.append_trace(
@@ -343,6 +566,9 @@ class Orchestrator:
                     comment=retry_comment,
                 )
 
+        last_result.artifacts["attempt_failure_classes"] = attempt_failure_classes.copy()
+        last_result.artifacts["tool_failure_attempts"] = tool_failure_attempts
+        last_result.artifacts["protocol_violation_attempts"] = protocol_violation_attempts
         return last_result
 
     async def _set_state(
@@ -393,464 +619,179 @@ class Orchestrator:
                 exc,
             )
 
+    def _validate_stage_protocol(self, stage: Stage, result: StageResult) -> StageResult:
+        return orch_governance.validate_stage_protocol(
+            stage=stage,
+            result=result,
+            tdd_enforcement_mode=self.tdd_enforcement_mode,
+        )
+
+    @staticmethod
+    def _first_non_empty_line(text: str) -> str:
+        return orch_governance.first_non_empty_line(text)
+
+    def _apply_review_evidence_gate(self, stage: Stage, result: StageResult) -> StageResult:
+        return orch_governance.apply_review_evidence_gate(
+            stage=stage,
+            result=result,
+            agents_use_mock=bool(self.config.settings.agents_use_mock),
+        )
+
+    @staticmethod
+    def _review_mentions_key_files(stdout: str, changed_files: list[Any]) -> bool:
+        return orch_governance.review_mentions_key_files(stdout, changed_files)
+
+    def _classify_failure(self, stage: Stage, result: StageResult) -> str:
+        return orch_governance.classify_failure(stage, result)
+
+    def _evaluate_handoff_trigger(
+        self,
+        *,
+        issue_id: str,
+        stage: Stage,
+        result: StageResult,
+    ) -> dict[str, Any] | None:
+        return orch_governance.evaluate_handoff_trigger(
+            stage=stage,
+            result=result,
+            traces=self.store.get_trace(issue_id),
+            human_handoff_enabled=self.human_handoff_enabled,
+        )
+
+    @staticmethod
+    def _build_review_fix_comment(result: StageResult) -> str:
+        return orch_comments.build_review_fix_comment(result)
+
+    async def _sync_tdd_summary_to_pr(
+        self,
+        *,
+        issue_id: str,
+        local_path: str,
+        pr_url: str,
+        coding_result: StageResult,
+    ) -> None:
+        await orch_pr_sync.sync_tdd_summary_to_pr(
+            store=self.store,
+            github_client=self.github_client,
+            logger=self.logger,
+            issue_id=issue_id,
+            local_path=local_path,
+            pr_url=pr_url,
+            coding_result=coding_result,
+        )
+
+    async def _sync_review_feedback_to_pr(self, *, pr_url: str, local_path: str, comment: str) -> None:
+        await orch_pr_sync.sync_review_feedback_to_pr(
+            github_client=self.github_client,
+            logger=self.logger,
+            pr_url=pr_url,
+            local_path=local_path,
+            comment=comment,
+        )
+
+    @staticmethod
+    def _extract_named_section(text: str, token: str) -> str:
+        return orch_pr_sync.extract_named_section(text, token)
+
     @staticmethod
     def _build_stage_comment(stage: Stage, result: StageResult) -> str:
-        stage_zh_map = Orchestrator._stage_zh_map()
-        status_zh_map = Orchestrator._status_zh_map()
-
-        human_parts = [
-            "[编排器]",
-            f"阶段：{stage_zh_map.get(stage, stage.value)}",
-            f"状态：{status_zh_map.get(result.status, result.status.value)}",
-            f"摘要：{Orchestrator._human_stage_summary(stage, result.status)}",
-        ]
-        if result.status in {StageStatus.FAILED, StageStatus.NEEDS_CHANGES}:
-            human_parts.append(f"原因：{Orchestrator._format_reason(result.summary, result.status)}")
-        if result.artifacts.get("pr_url"):
-            human_parts.append(f"PR：{result.artifacts['pr_url']}")
-
-        machine_parts = [
-            "[ORCH]",
-            f"stage={stage.value}",
-            f"status={result.status.value}",
-            f"summary={result.summary}",
-        ]
-        if result.artifacts.get("pr_url"):
-            machine_parts.append(f"pr_url={result.artifacts['pr_url']}")
-        return "\n".join([" | ".join(human_parts), " | ".join(machine_parts)])
+        return orch_comments.build_stage_comment(stage, result)
 
     @staticmethod
     def _build_retry_comment(stage: Stage, attempt: int, total_attempts: int, summary: str) -> str:
-        human_parts = [
-            "[编排器]",
-            f"阶段：{Orchestrator._stage_zh_map().get(stage, stage.value)}",
-            "状态：重试中",
-            "摘要：阶段失败后自动重试",
-            f"原因：{Orchestrator._format_reason(summary, StageStatus.FAILED)}",
-            f"尝试：{attempt}/{total_attempts}",
-        ]
-        machine_parts = [
-            "[ORCH]",
-            f"stage={stage.value}",
-            "status=retry",
-            f"attempt={attempt}",
-            f"total_attempts={total_attempts}",
-            f"summary={summary}",
-        ]
-        return "\n".join([" | ".join(human_parts), " | ".join(machine_parts)])
+        return orch_comments.build_retry_comment(stage, attempt, total_attempts, summary)
 
     @staticmethod
     def _build_blocked_comment(stage: Stage, result: StageResult) -> str:
-        human_parts = [
-            "[编排器]",
-            f"阶段：{Orchestrator._stage_zh_map().get(stage, stage.value)}",
-            "状态：已阻塞",
-            "摘要：达到失败上限，流程暂停",
-            f"原因：{Orchestrator._format_reason(result.summary, result.status)}",
-            "处理：请修复后调用 internal retry 接口或在 Plane 中重新触发。",
-        ]
-        machine_parts = [
-            "[ORCH]",
-            f"stage={stage.value}",
-            "status=blocked_notice",
-            f"summary={result.summary}",
-        ]
-        return "\n".join([" | ".join(human_parts), " | ".join(machine_parts)])
+        return orch_comments.build_blocked_comment(stage, result)
 
     @staticmethod
-    def _stage_zh_map() -> dict[Stage, str]:
-        return {
-            Stage.DESIGN: "设计",
-            Stage.CODING: "编码",
-            Stage.REVIEW: "审查",
-        }
+    def _build_arbiter_comment(arbiter_trace: dict[str, Any]) -> str:
+        return build_arbiter_comment(arbiter_trace)
 
-    @staticmethod
-    def _status_zh_map() -> dict[StageStatus, str]:
-        return {
-            StageStatus.SUCCESS: "成功",
-            StageStatus.FAILED: "失败",
-            StageStatus.NEEDS_CHANGES: "需修改",
-        }
-
-    @staticmethod
-    def _human_stage_summary(stage: Stage, status: StageStatus) -> str:
-        if status == StageStatus.SUCCESS:
-            if stage == Stage.DESIGN:
-                return "设计阶段执行成功"
-            if stage == Stage.CODING:
-                return "编码阶段执行成功"
-            return "审查阶段执行成功"
-        if status == StageStatus.NEEDS_CHANGES:
-            return "审查未通过，需要修改后重试"
-        return "阶段执行失败"
-
-    @staticmethod
-    def _format_reason(summary: str, status: StageStatus) -> str:
-        lowered = summary.lower()
-        if status == StageStatus.NEEDS_CHANGES:
-            return "审查要求修改"
-
-        timeout_match = re.search(r"timeout after (\d+)s", lowered)
-        if timeout_match:
-            return f"执行超时（{timeout_match.group(1)}s）"
-        if "command not found" in lowered:
-            return "命令未找到"
-        if "execution error" in lowered:
-            return "执行异常"
-        if "quality gate failed" in lowered:
-            return "质量门禁未通过"
-        if "review loop exceeded" in lowered:
-            return "审查回流超过上限"
-        if "fetch failed" in lowered:
-            return "模型网络请求失败"
-        return "阶段执行失败"
+    async def _resolve_review_overflow_with_design(
+        self,
+        issue_id: str,
+        project_id: str,
+        title: str,
+        project,
+        review_result: StageResult,
+        review_loops: int,
+    ) -> tuple[StageResult, PipelineState, dict[str, Any] | None]:
+        return await resolve_review_overflow_with_design(
+            store=self.store,
+            agent_adapter=self.agent_adapter,
+            issue_id=issue_id,
+            project_id=project_id,
+            title=title,
+            project=project,
+            review_result=review_result,
+            review_loops=review_loops,
+            max_review_loops=self.max_review_loops,
+            max_review_arbiter_loops=self.max_review_arbiter_loops,
+        )
 
     @staticmethod
     def extract_event_id(payload: dict[str, Any]) -> str:
-        candidate = payload.get("event_id") or payload.get("id")
-        if candidate:
-            return str(candidate)
-        data = payload.get("data", {})
-        if not isinstance(data, dict):
-            data = {}
-        item = data.get("work_item") or data.get("issue") or data
-        if isinstance(item, dict):
-            issue_id = item.get("id", "unknown")
-            updated_at = item.get("updated_at") or item.get("created_at") or "na"
-        else:
-            issue_id = "unknown"
-            updated_at = "na"
-        event_name = payload.get("event") or payload.get("type") or "unknown"
-        return f"{event_name}:{issue_id}:{updated_at}"
+        return orch_events.extract_event_id(payload)
 
     @staticmethod
     def extract_event_type(payload: dict[str, Any]) -> str:
-        return str(payload.get("event") or payload.get("event_type") or payload.get("type") or "")
+        return orch_events.extract_event_type(payload)
 
     @staticmethod
     def extract_issue(payload: dict[str, Any]) -> dict[str, str] | None:
-        data = payload.get("data")
-        if not isinstance(data, dict):
-            data = payload
-        item = data.get("work_item") or data.get("issue") or data
-        if not isinstance(item, dict):
-            return None
-
-        issue_id = item.get("id") or item.get("issue_id")
-        project_id = item.get("project_id")
-        if project_id is None and isinstance(item.get("project"), dict):
-            project_id = item["project"].get("id")
-
-        title = item.get("name") or item.get("title") or "Untitled"
-        description = Orchestrator._extract_issue_description(item)
-        state_name = item.get("state_name")
-        if not state_name and isinstance(item.get("state"), dict):
-            state_name = item["state"].get("name")
-        state_name = state_name or PipelineState.TODO.value
-
-        if issue_id is None or project_id is None:
-            return None
-
-        return {
-            "issue_id": str(issue_id),
-            "project_id": str(project_id),
-            "title": str(title),
-            "description": description,
-            "state": str(state_name),
-        }
+        return orch_events.extract_issue(payload)
 
     @staticmethod
     def _extract_issue_description(item: dict[str, Any]) -> str:
-        for key in ("description_html", "description", "description_binary", "description_markdown"):
-            value = item.get(key)
-            if isinstance(value, str) and value.strip():
-                return Orchestrator._normalize_description(value)
-        return ""
+        return orch_events.extract_issue_description(item)
 
     @staticmethod
     def _normalize_description(raw: str) -> str:
-        text = raw
-        text = re.sub(r"</h[1-6]>", "\n", text, flags=re.IGNORECASE)
-        text = re.sub(r"<li[^>]*>", "- ", text, flags=re.IGNORECASE)
-        text = re.sub(r"</li>", "\n", text, flags=re.IGNORECASE)
-        text = text.replace("</p>", "\n").replace("<br>", "\n").replace("<br/>", "\n").replace("<br />", "\n")
-        text = re.sub(r"<[^>]+>", " ", text)
-        text = html.unescape(text)
-        text = text.replace("\r\n", "\n")
-        text = re.sub(r"\n{3,}", "\n\n", text)
-        text = re.sub(r"[ \t]{2,}", " ", text)
-        return text.strip()
-
-    @staticmethod
-    def parse_tdd_sections(description: str) -> dict[str, str]:
-        sections = {"red": "", "green": "", "refactor": "", "acceptance": ""}
-        if not description.strip():
-            return sections
-
-        buffers = {k: [] for k in sections}
-        current: str | None = None
-        for raw_line in description.splitlines():
-            line = raw_line.strip()
-            marker = Orchestrator._detect_tdd_section_marker(line)
-            if marker:
-                current = marker
-                inline_content = Orchestrator._extract_inline_tdd_section_content(line, marker)
-                if inline_content:
-                    buffers[current].append(inline_content)
-                continue
-            if current:
-                buffers[current].append(raw_line.rstrip())
-
-        for key, lines in buffers.items():
-            sections[key] = "\n".join(x for x in lines if x.strip()).strip()
-        return sections
-
-    @staticmethod
-    def _detect_tdd_section_marker(line: str) -> str | None:
-        if not line:
-            return None
-        cleaned = line.lower()
-        cleaned = re.sub(r"^[\s#>*`\-0-9\.\)\(]+", "", cleaned)
-        cleaned = re.sub(r"[*_`]", "", cleaned).strip()
-        if not cleaned:
-            return None
-
-        if re.match(r"^tdd[\s_-]*red(?:\s*[:：].*)?$", cleaned):
-            return "red"
-        if Orchestrator._matches_tdd_stage_heading(cleaned, "red"):
-            return "red"
-        if cleaned.startswith("red_result") or cleaned.startswith("red_stage"):
-            return "red"
-        if re.match(r"^tdd[\s_-]*green(?:\s*[:：].*)?$", cleaned):
-            return "green"
-        if Orchestrator._matches_tdd_stage_heading(cleaned, "green"):
-            return "green"
-        if cleaned.startswith("green_result") or cleaned.startswith("green_stage"):
-            return "green"
-        if re.match(r"^tdd[\s_-]*refactor(?:\s*[:：].*)?$", cleaned):
-            return "refactor"
-        if Orchestrator._matches_tdd_stage_heading(cleaned, "refactor"):
-            return "refactor"
-        if cleaned.startswith("重构阶段"):
-            return "refactor"
-        if cleaned.startswith("refactor_note") or cleaned.startswith("refactor_stage"):
-            return "refactor"
-        if re.match(r"^tdd[\s_-]*acceptance(?:\s*[:：].*)?$", cleaned):
-            return "acceptance"
-        if cleaned.startswith("验收标准") or cleaned.startswith("acceptance criteria") or cleaned == "dod":
-            return "acceptance"
-        if cleaned.startswith("acceptance") or cleaned.startswith("dod"):
-            return "acceptance"
-        return None
-
-    @staticmethod
-    def _extract_inline_tdd_section_content(line: str, marker: str) -> str:
-        token_map = {
-            "red": (r"tdd[\s_-]*red", r"red_result", r"red_stage"),
-            "green": (r"tdd[\s_-]*green", r"green_result", r"green_stage"),
-            "refactor": (r"tdd[\s_-]*refactor", r"refactor_note", r"refactor_stage"),
-            "acceptance": (r"tdd[\s_-]*acceptance", r"acceptance(?:\s+criteria)?", r"dod"),
-        }
-        for token in token_map.get(marker, ()):
-            matched = re.match(rf"(?i)^[\s#>*`\-0-9\.\)\(]*{token}\s*[:：]\s*(.+)$", line.strip())
-            if not matched:
-                continue
-            content = matched.group(1).strip()
-            if content.lower() in {"(missing)", "missing", "n/a", "na", "none"}:
-                return ""
-            return content
-        return ""
-
-    @staticmethod
-    def _matches_tdd_stage_heading(cleaned: str, token: str) -> bool:
-        if cleaned in {token, f"{token}:", f"{token}："}:
-            return True
-        pattern = rf"^{re.escape(token)}(?:\s*(?:阶段|stage).*)?$"
-        return bool(re.match(pattern, cleaned))
-
-    @staticmethod
-    def _tdd_missing_sections(tdd_sections: dict[str, str]) -> list[str]:
-        required = ("red", "green", "refactor")
-        return [name for name in required if not str(tdd_sections.get(name, "")).strip()]
+        return orch_events.normalize_description(raw)
 
     def _has_tdd_reminder(self, issue_id: str) -> bool:
         traces = self.store.get_trace(issue_id)
         return any(t.get("stage") == "tdd" and t.get("status") == "reminder" for t in traces)
 
-    @staticmethod
-    def _extract_tdd_sections_from_stage_result(result: StageResult) -> dict[str, str]:
-        stdout = str(result.artifacts.get("stdout", "")).strip()
-        if not stdout:
-            return {"red": "", "green": "", "refactor": "", "acceptance": ""}
-        return Orchestrator.parse_tdd_sections(stdout)
+    def _has_contract_reminder(self, issue_id: str) -> bool:
+        traces = self.store.get_trace(issue_id)
+        return any(t.get("stage") == "contract" and t.get("status") == "advisory" for t in traces)
 
     @staticmethod
-    def _merge_tdd_sections(
-        base_description: str,
-        generated_sections: dict[str, str],
-    ) -> tuple[str, dict[str, str], bool]:
-        normalized_base = base_description.strip()
-        base_sections = Orchestrator.parse_tdd_sections(normalized_base)
-        section_labels = {
-            "red": "Red 阶段",
-            "green": "Green 阶段",
-            "refactor": "Refactor 阶段",
-            "acceptance": "验收标准（DoD）",
-        }
-
-        appended_parts: list[str] = []
-        for key in ("red", "green", "refactor", "acceptance"):
-            original = str(base_sections.get(key, "")).strip()
-            generated = str(generated_sections.get(key, "")).strip()
-            if original or not generated:
-                continue
-            appended_parts.append(f"### {section_labels[key]}\n{generated}")
-
-        if not appended_parts:
-            return normalized_base, base_sections, False
-
-        chunks = [normalized_base] if normalized_base else []
-        chunks.extend(appended_parts)
-        merged_description = "\n\n".join(chunks).strip()
-        merged_sections = Orchestrator.parse_tdd_sections(merged_description)
-        return merged_description, merged_sections, True
+    def _detect_high_risk_keywords(description: str) -> list[str]:
+        return orch_governance.detect_high_risk_keywords(description)
 
     @staticmethod
     def _description_to_html(description: str) -> str:
-        lines = description.splitlines()
-        parts: list[str] = []
-        list_items: list[str] = []
-
-        def flush_list() -> None:
-            nonlocal list_items
-            if not list_items:
-                return
-            li = "".join(f"<li>{html.escape(item)}</li>" for item in list_items)
-            parts.append(f"<ul>{li}</ul>")
-            list_items = []
-
-        for raw in lines:
-            line = raw.strip()
-            if not line:
-                flush_list()
-                continue
-
-            if line.startswith("- "):
-                list_items.append(line[2:].strip())
-                continue
-
-            flush_list()
-            heading = re.match(r"^(#{1,6})\s+(.+)$", line)
-            if heading:
-                level = len(heading.group(1))
-                text = heading.group(2).strip()
-                parts.append(f"<h{level}>{html.escape(text)}</h{level}>")
-                continue
-            parts.append(f"<p>{html.escape(line)}</p>")
-
-        flush_list()
-        return "".join(parts) if parts else "<p></p>"
+        return orch_events.description_to_html(description)
 
     @staticmethod
     def _run_git(local_path: str, args: list[str]) -> tuple[bool, str]:
-        try:
-            completed = subprocess.run(
-                args,
-                cwd=local_path,
-                check=False,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
-            )
-        except Exception as exc:  # noqa: BLE001
-            return False, str(exc)
-        output = "\n".join(x for x in [completed.stdout, completed.stderr] if x).strip()
-        if completed.returncode != 0:
-            return False, output or f"exit={completed.returncode}"
-        return True, output.strip()
+        return orch_review_context.run_git(local_path, args)
 
     def _collect_review_context(self, local_path: str, base_branch: str, branch: str) -> dict[str, Any]:
-        meta: dict[str, Any] = {
-            "review_base_branch": base_branch,
-            "review_branch": branch,
-            "review_changed_files": [],
-            "review_diff": "",
-            "review_diff_range": "",
-            "review_diff_truncated": False,
-        }
-        if not local_path:
-            meta["review_context_error"] = "workspace path is empty"
-            return meta
+        return orch_review_context.collect_review_context(local_path, base_branch, branch)
 
-        ok_git, _ = self._run_git(local_path, ["git", "rev-parse", "--is-inside-work-tree"])
-        if not ok_git:
-            meta["review_context_error"] = f"not a git repo: {local_path}"
-            return meta
+    def _collect_diff_by_files(
+        self,
+        local_path: str,
+        diff_range: str,
+        changed_files: list[str],
+        max_chars: int,
+    ) -> tuple[str, list[str], bool]:
+        return orch_review_context.collect_diff_by_files(
+            local_path=local_path,
+            diff_range=diff_range,
+            changed_files=changed_files,
+            max_chars=max_chars,
+        )
 
-        ok_head, head_branch = self._run_git(local_path, ["git", "rev-parse", "--abbrev-ref", "HEAD"])
-        if ok_head and head_branch and not meta["review_branch"]:
-            meta["review_branch"] = head_branch
-
-        branch_ref = str(meta["review_branch"] or "").strip()
-        range_candidates: list[str] = []
-        if branch_ref and branch_ref != "HEAD":
-            range_candidates.extend(
-                [
-                    f"origin/{base_branch}...{branch_ref}",
-                    f"{base_branch}...{branch_ref}",
-                    f"origin/{base_branch}..{branch_ref}",
-                    f"{base_branch}..{branch_ref}",
-                ]
-            )
-        range_candidates.extend(["origin/HEAD..HEAD", "HEAD~1..HEAD"])
-
-        chosen_range = ""
-        changed_files: list[str] = []
-        diff_text = ""
-        last_error = ""
-        for rng in range_candidates:
-            ok_files, files_out = self._run_git(local_path, ["git", "diff", "--name-only", rng])
-            ok_diff, diff_out = self._run_git(local_path, ["git", "diff", "--no-color", rng])
-            if not ok_files or not ok_diff:
-                last_error = files_out if not ok_files else diff_out
-                continue
-            chosen_range = rng
-            changed_files = [x.strip() for x in files_out.splitlines() if x.strip()]
-            diff_text = diff_out
-            break
-
-        if not chosen_range:
-            ok_files, files_out = self._run_git(local_path, ["git", "diff", "--name-only"])
-            ok_diff, diff_out = self._run_git(local_path, ["git", "diff", "--no-color"])
-            if ok_files and ok_diff:
-                chosen_range = "working-tree"
-                changed_files = [x.strip() for x in files_out.splitlines() if x.strip()]
-                diff_text = diff_out
-            else:
-                meta["review_context_error"] = last_error or files_out or diff_out or "failed to collect diff"
-                return meta
-
-        max_chars = 120_000
-        meta["review_diff_range"] = chosen_range
-        meta["review_changed_files"] = changed_files
-        meta["review_diff_truncated"] = len(diff_text) > max_chars
-        meta["review_diff"] = diff_text[:max_chars]
-        if not diff_text.strip():
-            meta["review_context_error"] = "empty diff"
-        return meta
+    @staticmethod
+    def _prioritize_review_files(changed_files: list[str]) -> list[str]:
+        return orch_review_context.prioritize_review_files(changed_files)
 
     @staticmethod
     def should_start_pipeline(event_type: str, issue_data: dict[str, str]) -> bool:
-        state = issue_data["state"].lower()
-        event = event_type.lower()
-        if "created" in event:
-            return True
-        if "updated" in event and state in {
-            PipelineState.TODO.value.lower(),
-            PipelineState.DESIGN.value.lower(),
-            PipelineState.CODING.value.lower(),
-            PipelineState.REVIEW.value.lower(),
-        }:
-            return True
-        return False
+        return orch_events.should_start_pipeline(event_type, issue_data)

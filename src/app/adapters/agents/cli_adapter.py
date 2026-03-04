@@ -188,6 +188,13 @@ class CliAgentAdapter:
             base.extend(CliAgentAdapter._tdd_prompt_lines(context))
 
         if stage == Stage.DESIGN:
+            if str(context.metadata.get("design_mode", "")).strip().lower() == "review_arbiter":
+                base.extend(CliAgentAdapter._review_arbiter_prompt_lines(context))
+                base.append("All narrative text must be in Simplified Chinese.")
+                base.append("First non-empty line must be exactly one token: CONTINUE_CODING or STOP_REVIEW.")
+                base.append("Then output exactly 3 lines with prefixes: DIAGNOSIS:, REASON:, ACTIONS:.")
+                base.append("DIAGNOSIS must be exactly one token: QUALITY_ISSUE or GEMINI_ISSUE.")
+                return "\n".join(base)
             base.append(
                 "You own test and implementation design. If Red/Green/Refactor content is missing, generate it."
             )
@@ -248,6 +255,9 @@ class CliAgentAdapter:
             lines.append(f"Diff Range: {diff_range}")
 
         diff_text = str(context.metadata.get("review_diff", "")).strip()
+        included = context.metadata.get("review_diff_files_included")
+        if isinstance(included, list) and included:
+            lines.append(f"Diff Files Included: {', '.join(str(x) for x in included[:40])}")
         if diff_text:
             lines.append("Code Diff for Review:")
             lines.append("```diff")
@@ -261,4 +271,29 @@ class CliAgentAdapter:
         err = str(context.metadata.get("review_context_error", "")).strip()
         if err:
             lines.append(f"Review Context Error: {err}")
+        return lines
+
+    @staticmethod
+    def _review_arbiter_prompt_lines(context: IssueContext) -> list[str]:
+        lines = ["Review Arbiter Context:"]
+        lines.append(f"Review Loop Count: {context.review_loops}")
+        lines.append(f"Arbiter Loop Count: {context.arbiter_loops}")
+
+        failure_summary = str(context.metadata.get("review_failure_summary", "")).strip()
+        if failure_summary:
+            lines.append(f"Latest Review Failure Summary: {failure_summary[:400]}")
+
+        failure_stdout = str(context.metadata.get("review_failure_stdout", "")).strip()
+        if failure_stdout:
+            lines.append(f"Latest Review Failure Stdout: {failure_stdout[:800]}")
+
+        failure_stderr = str(context.metadata.get("review_failure_stderr", "")).strip()
+        if failure_stderr:
+            lines.append(f"Latest Review Failure Stderr: {failure_stderr[:800]}")
+
+        signals = context.metadata.get("review_failure_signals")
+        if isinstance(signals, list) and signals:
+            lines.append(f"Failure Signals: {', '.join(str(x) for x in signals[:20])}")
+        else:
+            lines.append("Failure Signals: (none)")
         return lines

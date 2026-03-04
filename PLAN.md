@@ -13,8 +13,49 @@
 - M4 Plane 集成与 Webhook 入站: done
 - M5 通知链路（Plane Webhook -> 飞书）: done
 - M6 测试与验收: done
+- M7 Issue 合同化（TDD Contract）: done
+- M8 三 Agent 角色契约（可校验输出）: done
+- M9 Review 证据门禁强化: done
+- M10 失败分类与人类接管: done
+- M11 Plane + GitHub 协同可视化: done
+- M12 运行策略配置化与文档固化: done
 
 ## Progress Log
+- 时间: 2026-03-04 13:56:31 CST
+  - 里程碑: M7/M8/M9/M10/M11/M12
+  - 完成内容: 完成多 Agent TDD 协作治理落地：新增 Issue 合同解析与评分提醒（`[TDD-Contract-提醒]`）；新增 Design/Coding/Review 协议校验与 `PROTOCOL_VIOLATION` 分类；新增 Review 证据完整性门禁与失败信号结构化；新增人类接管触发与 `[HUMAN-HANDOFF]` 中文评论（含建议动作/重试命令）；新增 PR 侧证据同步（Coding TDD 摘要、Review 修复清单）；补齐配置项 `HUMAN_HANDOFF_ENABLED` 与 `TDD_ENFORCEMENT_MODE`，并更新 README。
+  - 证据: `/Volumes/exFAT/multiagent/src/app/orchestrator.py`、`/Volumes/exFAT/multiagent/src/app/tdd_parser.py`、`/Volumes/exFAT/multiagent/src/app/comment_utils.py`、`/Volumes/exFAT/multiagent/src/app/store.py`、`/Volumes/exFAT/multiagent/src/app/models.py`、`/Volumes/exFAT/multiagent/src/app/adapters/github_client.py`、`/Volumes/exFAT/multiagent/.env.example`、`/Volumes/exFAT/multiagent/README.md`、`/Volumes/exFAT/multiagent/tests/test_orchestrator.py`、`/Volumes/exFAT/multiagent/tests/test_tdd_parser.py`、`/Volumes/exFAT/multiagent/tests/test_store.py`、`/Volumes/exFAT/multiagent/tests/test_github_client.py`、`uv run pytest -q -> 全部通过`
+  - 下一步: 在 Plane 新 issue 上做一次真实联调（非 mock agent），重点验证 `HUMAN-HANDOFF` 与 PR 双向评论同步在真实 CLI 超时/驳回场景下的可观测性。
+- 时间: 2026-03-04 01:29:31 CST
+  - 里程碑: M1/M6
+  - 完成内容: 加固仲裁降级策略：当 Design 仲裁执行失败时，不再一律 STOP；若检测到 Gemini 侧信号（timeout/503/fetch failed/review_context_error/diff_truncated）则自动降级为 `CONTINUE_CODING`，并新增“若诊断为 `GEMINI_ISSUE` 则强制继续编码”的一致性规则；已补充对应单测并全量回归通过。
+  - 证据: `/Volumes/exFAT/multiagent/src/app/review_arbiter.py`、`/Volumes/exFAT/multiagent/tests/test_orchestrator.py`；`uv run pytest -q` 全部通过。
+  - 下一步: 清理工作区中由历史 coding 产生但未入库的文件差异（如 `src/app/tdd_parser.py`/`tests/test_tdd_parser.py`）并在 Plane 新 issue 验证 `CONTINUE_CODING` 真实分支。
+- 时间: 2026-03-04 01:17:35 CST
+  - 里程碑: M6
+  - 完成内容: 在最新工作区状态下完成全量回归测试，确认新引入的仲裁与行数门禁未破坏现有链路；同时确认真实联调过程中由 Coding 阶段生成的新文件（`src/app/tdd_parser.py`、`tests/test_tdd_parser.py`）也能通过当前测试集。
+  - 证据: `uv run pytest -q -> 81 passed`。
+  - 下一步: 继续验证 `CONTINUE_CODING` 真实分支，并在确认后整理一版可直接发布的变更清单（含是否纳入新增 `tdd_parser` 文件的决策）。
+- 时间: 2026-03-04 01:16:32 CST
+  - 里程碑: M4/M6
+  - 完成内容: 继续进行真实仲裁联调：对 issue `f953a357-e672-47ba-b4ea-1e9d096e6280` 执行 retry，已成功触发 Design 仲裁并由 Design 给出 `STOP_REVIEW`，流程按预期进入 Blocked；验证“Review 超限后先仲裁、再决策”已在真实链路生效。
+  - 证据: `curl -X POST http://127.0.0.1:8787/internal/issues/f953a357-e672-47ba-b4ea-1e9d096e6280/retry -> 200`；`issue_traces` 新增 `id=131(stage=design_arbiter,status=success,message=Design arbiter decided stop_review.)`、`id=132(stage=review,status=failed,summary=Review arbiter decided to stop review.)`、`id=133(state=blocked)`；`issue_runs(f953...).arbiter_loops=1`。
+  - 下一步: 继续构造一次“Gemini问题”场景（timeout/503）以验证 `CONTINUE_CODING` 分支的真实联调闭环。
+- 时间: 2026-03-04 01:12:05 CST
+  - 里程碑: M3/M4/M6
+  - 完成内容: 完成“1000 行硬限制”真实联调：临时创建 `tmp_line_limit_probe.py`（1001 行）并在 `AGENTS_USE_MOCK=true` 下触发 issue `c0e23ec9-1b62-4366-a51d-7a9a3bc8145f` 的 Coding 重试，流程被正确阻断到 Blocked；Plane 中文评论已显示“超限文件：tmp_line_limit_probe.py(1001行)”。验证后已删除临时文件并恢复服务为真实 Agent 模式（`AGENTS_USE_MOCK=false`）。
+  - 证据: `issue_traces(c0e...).coding failed -> Code file line limit exceeded (1000)`，metadata 含 `line_limit_violations=[{\"path\":\"tmp_line_limit_probe.py\",\"lines\":1001}]`；Plane comment `e95e8ecd-1830-4f38-9a04-7d817860944d`；`curl http://127.0.0.1:8787/healthz -> {\"ok\":true}`。
+  - 下一步: 用一个新的真实 issue 验证“Review 超限 -> 设计仲裁 -> CONTINUE_CODING”分支（当前 e97 已触发过 STOP_REVIEW 与仲裁上限分支）。
+- 时间: 2026-03-04 01:10:12 CST
+  - 里程碑: M4/M6
+  - 完成内容: 已完成真实联调验证新仲裁链路：重启服务后对 issue `e97c0ad0-2552-416b-94d4-0dc5d9882e1c` 执行 `/internal/issues/{issue_id}/retry`，确认 Plane 评论出现“阶段：设计仲裁 | 结论：停止审查 | 判因：质量问题”；同时验证“仲裁超上限”会进入 Blocked 并给出中文原因。联调过程中发现并规避全局环境变量 `PLANE_BASE_URL=https://localhost:8080/api` 覆盖 `.env` 导致的 SSL 失败，已用启动命令显式指定 `PLANE_BASE_URL=http://localhost:8080`。
+  - 证据: `curl -X POST http://127.0.0.1:8787/internal/issues/e97c0ad0-2552-416b-94d4-0dc5d9882e1c/retry -> 200`；`issue_runs(e97...).state=Blocked, review_loops=4, arbiter_loops=1`；Plane comments 新增 `19acee29-907a-4a2c-ac8c-65bb2a3e378d`（设计仲裁）与 `08f5bf64-a402-4b70-96bb-9fa371cfc34b`（blocked_notice）。
+  - 下一步: 在 Plane 新建一个“代码文件超 1000 行”验证 issue（或在本地临时制造超限文件）进行真实 Coding 阶段门禁联调，确认超限文件会被中文评论明确指出并阻断进入 Review。
+- 时间: 2026-03-04 00:09:10 CST
+  - 里程碑: M1/M2/M3/M6
+  - 完成内容: 实施“Review 回流仲裁 + 1000 行硬限制”：Review 超限时不再直接阻塞，改为触发 Design 仲裁（仅 `CONTINUE_CODING/STOP_REVIEW`）；新增仲裁次数上限（1 次）；Coding 后新增全仓代码文件单文件行数硬门禁（默认 1000）；补齐配置项、SQLite `arbiter_loops` 迁移、中文仲裁评论与 trace 元数据。
+  - 证据: `/Volumes/exFAT/multiagent/src/app/orchestrator.py`、`/Volumes/exFAT/multiagent/src/app/review_arbiter.py`、`/Volumes/exFAT/multiagent/src/app/comment_utils.py`、`/Volumes/exFAT/multiagent/src/app/adapters/agents/cli_adapter.py`、`/Volumes/exFAT/multiagent/src/app/quality_gate.py`、`/Volumes/exFAT/multiagent/src/app/config.py`、`/Volumes/exFAT/multiagent/src/app/store.py`、`/Volumes/exFAT/multiagent/tests/test_orchestrator.py`、`/Volumes/exFAT/multiagent/tests/test_cli_agent_adapter.py`、`/Volumes/exFAT/multiagent/tests/test_quality_gate.py`、`/Volumes/exFAT/multiagent/tests/test_store.py`、`uv run pytest -q -> 60 passed`
+  - 下一步: 在 Plane 新建一个“Review 连续驳回”issue 做真实联调，确认仲裁评论显示“判因/结论”，并验证超限文件场景会在 Coding 阶段被硬阻断。
 - 时间: 2026-03-03 22:44:28 CST
   - 里程碑: M2/M4
   - 完成内容: 已按你确认执行“Review 未通过 -> 继续派发 Codex Coding”动作：针对 issue `f953a357-e672-47ba-b4ea-1e9d096e6280` 回写中文派单评论，明确继续修复目标（补齐可审查 diff、按审查意见修复核心文件）；当前编排状态保持在 Coding，等待本轮编码执行完成。
@@ -170,3 +211,43 @@
   - 完成内容: 初始化 uv 项目并实现状态机、Mock agent、GitHub client、质量门禁、FastAPI 主入口。
   - 证据: `pyproject.toml`、`src/app/state_machine.py`、`src/app/adapters/agents/mock_adapter.py`、`src/app/adapters/github_client.py`、`src/app/quality_gate.py`、`src/app/main.py`
   - 下一步: 增加测试覆盖并跑通验收。
+- 时间: 2026-03-04 14:15:00 CST
+  - 里程碑: 拆分准备
+  - 完成内容: 完成 `src/app/orchestrator.py` 与 `tests/test_orchestrator.py` 函数边界梳理，确认可按 `events/review_context/governance/pr_sync/comments` 五模块做低风险“先搬运后委托”迁移。
+  - 证据: `wc -l src/app/orchestrator.py tests/test_orchestrator.py`；`rg -n` 函数清单。
+  - 下一步: 创建 `src/app/orch/*` 五模块并保持逻辑等价。
+- 时间: 2026-03-04 14:29:00 CST
+  - 里程碑: 代码拆分（阶段1）
+  - 完成内容: 新增 `src/app/orch/events.py`、`review_context.py`、`governance.py`、`pr_sync.py`、`comments.py`，并将 `Orchestrator` 相关旧方法改为薄封装委托，保持方法签名与调用入口不变。
+  - 证据: `uv run pytest -q tests/test_orchestrator.py -> 36 passed`。
+  - 下一步: 拆分 `tests/test_orchestrator.py` 到 `tests/orchestrator/` 多文件（每文件 <= 500 行）。
+- 时间: 2026-03-04 14:36:00 CST
+  - 里程碑: 测试拆分
+  - 完成内容: 已将 `tests/test_orchestrator.py` 拆分到 `tests/orchestrator/`（`helpers.py` + 5 个测试文件），并删除原大文件，单文件规模降到 500 行内。
+  - 证据: `uv run pytest -q tests/orchestrator -> 36 passed`。
+  - 下一步: 执行全量回归 `uv run pytest -q`。
+- 时间: 2026-03-04 14:41:00 CST
+  - 里程碑: 全量回归
+  - 完成内容: 已执行全量测试回归，确认拆分后行为不变。
+  - 证据: `uv run pytest -q -> 92 passed`。
+  - 下一步: 输出变更清单与 QualityGate 口径最大文件行数统计。
+- 时间: 2026-03-04 14:42:00 CST
+  - 里程碑: 行数门禁统计
+  - 完成内容: 按 `QualityGate` 同口径（代码后缀 + 忽略目录）统计最大文件行数，当前最大为 `src/app/orchestrator.py` 的 797 行，已低于 1000。
+  - 证据: 统计输出 `MAX 797 src/app/orchestrator.py`。
+  - 下一步: 交付最终摘要、文件清单（含行号）。
+- 时间: 2026-03-04 14:50:00 CST
+  - 里程碑: 拆分任务收口
+  - 完成内容: 已完成本轮拆分任务闭环：`orchestrator` 模块拆分、薄封装委托、`tests/test_orchestrator.py` 拆分、全量回归通过、行数门禁统计与交付说明。
+  - 证据: `uv run pytest -q -> 92 passed`；`MAX 797 src/app/orchestrator.py`。
+  - 下一步: 无（本轮开发任务均已完成）。
+- 时间: 2026-03-04 19:16:05 CST
+  - 里程碑: MULTIAGENT-11 联调验证
+  - 完成内容: 按联调计划触发 `work_item.created`（签名 webhook），成功跑通 `Design -> Coding -> Review -> Done`；本地 trace 完整、`issue_runs` 终态为 `Done`，并已在 Plane 回写编排评论。
+  - 证据: issue `d58fc3ad-7115-416a-93a8-170d22e42d35`；`/internal/issues/{id}/trace` 显示 7 条关键轨迹；`issue_runs.state=Done`；Plane comments `count=3` 且包含 `[编排器]/[ORCH]`。
+  - 下一步: 无（本次联调目标已完成）。
+- 时间: 2026-03-04 19:27:13 CST
+  - 里程碑: README 文档补全
+  - 完成内容: 按当前项目状态重写 `README.md`，补充架构拆分（`app/orch/*`）、环境配置、启动步骤、API、治理阈值、联调与排障说明。
+  - 证据: `README.md` 更新完成。
+  - 下一步: 执行最小校验并提交推送到 GitHub。

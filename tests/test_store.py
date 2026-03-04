@@ -38,6 +38,9 @@ def test_store_migrates_issue_runs_add_description_column(tmp_path: Path):
     cols = {row[1] for row in conn.execute("PRAGMA table_info(issue_runs)").fetchall()}
     conn.close()
     assert "description" in cols
+    assert "arbiter_loops" in cols
+    assert "failure_class" in cols
+    assert "handoff_reason" in cols
 
 
 def test_store_upsert_issue_preserves_description_when_blank(tmp_path: Path):
@@ -49,3 +52,17 @@ def test_store_upsert_issue_preserves_description_when_blank(tmp_path: Path):
     assert issue is not None
     assert issue["title"] == "title2"
     assert issue["description"] == "desc-v1"
+
+
+def test_store_update_issue_failure_fields(tmp_path: Path):
+    store = SQLiteStore(str(tmp_path / "store2.sqlite"))
+    store.upsert_issue("i-2", "p-1", "title", "Todo", description="desc")
+    store.update_issue_fields(
+        "i-2",
+        failure_class="PROTOCOL_VIOLATION",
+        handoff_reason="protocol_violation_consecutive",
+    )
+    issue = store.get_issue("i-2")
+    assert issue is not None
+    assert issue["failure_class"] == "PROTOCOL_VIOLATION"
+    assert issue["handoff_reason"] == "protocol_violation_consecutive"

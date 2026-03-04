@@ -199,3 +199,20 @@ def test_create_pr_commits_when_staged_changes_detected(monkeypatch, tmp_path: P
     )
     assert result.pr_url.endswith("/pull/100")
     assert any(cmd[:2] == ["git", "commit"] for cmd in calls)
+
+
+def test_add_pr_comment_calls_gh(monkeypatch, tmp_path: Path):
+    client = _make_client(tmp_path)
+    calls: list[list[str]] = []
+
+    def fake_run(cmd: list[str], cwd: str) -> str:
+        calls.append(cmd)
+        return ""
+
+    monkeypatch.setattr(client, "_run", fake_run)
+    client.add_pr_comment(
+        pr_url="https://github.com/boathell/multiagent/pull/1",
+        body="review feedback",
+        local_path=str(tmp_path),
+    )
+    assert ["gh", "pr", "comment", "https://github.com/boathell/multiagent/pull/1", "--body", "review feedback"] in calls
